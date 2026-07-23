@@ -22,81 +22,179 @@ import java.util.function.Supplier;
 
 public record FileDownloader(String url, String target, String hash) implements Supplier<Path> {
 
+    // Timeouts configurable via system properties
+    private static final int CONNECT_TIMEOUT_MS = Integer.getInteger(
+        "arclight.download.connectTimeout", 20_000
+    );
+    private static final int READ_TIMEOUT_MS = Integer.getInteger(
+        "arclight.download.readTimeout", 30_000
+    );
+
+    // Max redirects to follow before giving up
+    private static final int MAX_REDIRECTS = 10;
+
+    // User-agent so servers don't block us as an unknown bot
+    private static final String USER_AGENT =
+        "Arclight-Installer/1.0 (https://github.com/IzzelAliz/Arclight)";
+
     @Override
     public Path get() {
         try {
             Path path = new File(target).toPath();
+
+            // Remove stale directory at target path if present
             if (Files.exists(path) && Files.isDirectory(path)) {
                 Files.delete(path);
             }
+
+            // File already exists — validate hash and return early
             if (Files.exists(path)) {
-                if (Files.isDirectory(path)) {
-                    throw new FileAlreadyExistsException(target);
-                } else {
-                    if (Util.hash(path).equalsIgnoreCase(hash)) return path;
-                    else Files.delete(path);
+                if (hashMatches(path, this.hash)) {
+                    return path;
                 }
+                // Hash mismatch — delete and re-download
+                Files.delete(path);
             }
-            if (!Files.exists(path) && path.getParent() != null) {
+
+            // Ensure parent directories exist
+            if (path.getParent() != null) {
                 Files.createDirectories(path.getParent());
             }
-            var tmp = new File(target + ".tmp").toPath();
-            try (InputStream stream = read(url)) {
-                Files.copy(stream, tmp, StandardCopyOption.REPLACE_EXISTING);
-            } catch (SocketTimeoutException | SSLException e) {
-                throw new RuntimeException("Timeout " + url);
-            }
-            if (Files.exists(tmp)) {
-                String hash = Util.hash(tmp);
-                if (hash.equalsIgnoreCase(this.hash)) {
-                    Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
-                    return path;
-                } else {
-                    Files.delete(tmp);
-                    throw new RuntimeException("Hash not match, expect %s found %s in %s".formatted(this.hash, hash, url));
-                }
-            } else {
-                throw new RuntimeException("Not found " + url);
-            }
+
+            return downloadToTemp(path);
+
         } catch (AccessDeniedException e) {
-            throw new RuntimeException("Access denied for file " + e.getFile(), e);
+            throw new RuntimeException(
+                "Access denied for file: " + e.getFile() +
+                ". Check that the server directory is writable.", e
+            );
         } catch (Exception e) {
             Util.throwException(e);
             return null;
         }
     }
 
-    static InputStream read(String url) throws IOException {
-        return redirect(new URL(url));
+    // Downloads to a .tmp file then atomically moves it to the final path
+private Path downloadToTemp(Path finalPath) throws IOException {
+    Path tmp = new File(target + ".tmp").toPath();
+
+    System.out.println("  Downloading: " + url);
+
+    try (InputStream stream = read(url)) {
+        Files.copy(stream, tmp, StandardCopyOption.REPLACE_EXISTING);
+    } catch (SocketTimeoutException e) {
+        deleteSilently(tmp);
+        throw new RuntimeException(
+            "Timeout after " + READ_TIMEOUT_MS + "ms while downloading: " + url
+        );
+    } catch (SSLException e) {
+        deleteSilently(tmp);
+        throw new RuntimeException(
+            "SSL error while downloading: " + url + " — " + e.getMessage()
+        );
+    } catch (Exception e) {
+        deleteSilently(tmp);
+        throw new IOException("Failed to download: " + url, e);
     }
 
-    private static InputStream redirect(URL url) throws IOException {
-        return redirect(url, new HashSet<>());
+    if (!Files.exists(tmp)) {
+        throw new RuntimeException("Downloaded file not found after transfer: " + url);
     }
 
-    private static InputStream redirect(URL url, Set<String> history) throws IOException {
-        if (history.contains(url.toString())) {
-            StringJoiner joiner = new StringJoiner("\n        ");
-            joiner.add("");
-            history.forEach(joiner::add);
-            throw new RuntimeException("Redirect error " + joiner);
-        } else {
-            history.add(url.toString());
+    // Validate hash of the downloaded file
+    String actualHash;
+    try {
+        actualHash = Util.hash(tmp);
+    } catch (Exception e) {
+        deleteSilently(tmp);
+        throw new IOException("Failed to compute hash for downloaded file: " + tmp, e);
+    }
+
+    if (!actualHash.equalsIgnoreCase(this.hash)) {
+        deleteSilently(tmp);
+        throw new RuntimeException(
+            "Hash mismatch for: " + url +
+            "\n  Expected : " + this.hash +
+            "\n  Actual   : " + actualHash
+        );
+    }
+
+    // Atomically replace the final file
+    Files.move(tmp, finalPath, StandardCopyOption.REPLACE_EXISTING);
+    return finalPath;
+}
+
+    // Checks whether an existing file matches the expected hash
+private static boolean hashMatches(Path path, String expectedHash) {
+    if (expectedHash == null || expectedHash.isBlank()) return true;
+    try {
+        return Util.hash(path).equalsIgnoreCase(expectedHash);
+    } catch (Exception e) {
+        return false;
+    }
+}
+
+    // Deletes a file without throwing — used for cleanup of .tmp files
+    private static void deleteSilently(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
         }
+    }
+
+    // Public — used by MinecraftProvider for manifest downloads
+    static InputStream read(String url) throws IOException {
+        return redirect(new URL(url), new HashSet<>(), 0);
+    }
+
+    private static InputStream redirect(URL url, Set<String> history, int depth) throws IOException {
+        if (depth > MAX_REDIRECTS) {
+            StringJoiner joiner = new StringJoiner("\n  → ");
+            joiner.add("Too many redirects (" + MAX_REDIRECTS + "):");
+            history.forEach(joiner::add);
+            throw new RuntimeException(joiner.toString());
+        }
+
+        if (history.contains(url.toString())) {
+            throw new RuntimeException("Redirect loop detected at: " + url);
+        }
+        history.add(url.toString());
+
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
         connection.setInstanceFollowRedirects(false);
-        connection.setReadTimeout(15000);
-        connection.setConnectTimeout(15000);
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setRequestProperty("User-Agent", USER_AGENT);
+        connection.setRequestProperty("Accept-Encoding", "identity");
+
         int responseCode = connection.getResponseCode();
-        if (responseCode == HttpURLConnection.HTTP_OK) {
-            return connection.getInputStream();
-        } else if (responseCode == HttpURLConnection.HTTP_MOVED_PERM || responseCode == HttpURLConnection.HTTP_MOVED_TEMP) {
-            String location = URLDecoder.decode(connection.getHeaderField("Location"), StandardCharsets.UTF_8);
-            return redirect(new URL(url, location));
-        } else if (responseCode == HttpURLConnection.HTTP_NOT_FOUND || responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
-            throw new RuntimeException("Not found " + url);
-        } else {
-            throw new RemoteException("Http " + responseCode + " " + url);
+
+        switch (responseCode) {
+            case HttpURLConnection.HTTP_OK -> {
+                return connection.getInputStream();
+            }
+            case HttpURLConnection.HTTP_MOVED_PERM,
+                 HttpURLConnection.HTTP_MOVED_TEMP,
+                 307, 308 -> {
+                String location = URLDecoder.decode(
+                    connection.getHeaderField("Location"),
+                    StandardCharsets.UTF_8
+                );
+                connection.disconnect();
+                return redirect(new URL(url, location), history, depth + 1);
+            }
+            case HttpURLConnection.HTTP_NOT_FOUND -> {
+                connection.disconnect();
+                throw new RuntimeException("Not found (404): " + url);
+            }
+            case HttpURLConnection.HTTP_FORBIDDEN -> {
+                connection.disconnect();
+                throw new RuntimeException("Forbidden (403): " + url);
+            }
+            default -> {
+                connection.disconnect();
+                throw new RemoteException("HTTP " + responseCode + ": " + url);
+            }
         }
     }
 }

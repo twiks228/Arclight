@@ -5,12 +5,13 @@ license="GNU GENERAL PUBLIC LICENSE Version 3"
 [[mods]]
 modId="arclight"
 version="${version}"
-displayName="Arclight Mod"
+displayName="Arclight J2K"
 displayTest="IGNORE_SERVER_VERSION"
-credits="lona,夜幕"
-authors="IzzelAliz"
+credits="lona, contributors"
+authors="IzzelAliz, Jake (twiks228)"
 description='''
-    Arclight bukkit layer for NeoForge
+    Arclight J2K - NeoForge + Paper hybrid server core.
+    Enhanced fork with improved installer diagnostics and compatibility tools.
     '''
 
 [[accessTransformers]]

@@ -22,6 +22,7 @@ import org.bukkit.plugin.PluginDescriptionFile;
 import org.bukkit.plugin.SimplePluginManager;
 import org.jetbrains.annotations.NotNull;
 import org.spigotmc.SpigotConfig;
+import org.bukkit.command.CommandSender;
 
 import java.io.File;
 import java.util.Collections;
@@ -99,6 +100,8 @@ public class ArclightServer {
                 if (VelocitySupport.isEnabled()) {
                     SpigotConfig.bungee = true;
                 }
+                // Register Arclight J2K commands
+                registerJ2KCommands();
             } catch (Throwable t) {
                 LOGGER.error("registry.error", t);
                 throw t;
@@ -151,4 +154,44 @@ public class ArclightServer {
     public static World.Environment getEnvironment(ResourceKey<LevelStem> key) {
         return BukkitRegistry.DIM_MAP.getOrDefault(key, World.Environment.CUSTOM);
     }
+    // Registers Arclight J2K built-in commands
+private static void registerJ2KCommands() {
+    try {
+        var j2kCommand = new io.izzel.arclight.common.mod.command.J2KCommand();
+        var craftServer = (org.bukkit.craftbukkit.v.CraftServer) server;
+        var commandMap = craftServer.getCommandMap();
+
+        // Use a simple FallbackCommand wrapper
+        commandMap.register("j2k", "arclight", new org.bukkit.command.Command("j2k") {
+            {
+                setDescription("Arclight J2K diagnostics and status command");
+                setUsage("/j2k <status|version|scan|memory|help>");
+                setPermission("arclight.command.j2k");
+            }
+
+            @Override
+            public boolean execute(org.bukkit.command.CommandSender sender,
+                                   String commandLabel, String[] args) {
+                if (!sender.hasPermission("arclight.command.j2k")
+                        && !sender.isOp()) {
+                    sender.sendMessage("\u00a7cYou don't have permission to use this command.");
+                    return true;
+                }
+                return j2kCommand.onCommand(sender, this, commandLabel, args);
+            }
+
+            @Override
+            public java.util.List<String> tabComplete(
+                    org.bukkit.command.CommandSender sender,
+                    String alias, String[] args) {
+                var result = j2kCommand.onTabComplete(sender, this, alias, args);
+                return result != null ? result : java.util.List.of();
+            }
+        });
+
+        LOGGER.info("[Arclight-J2K] Registered /j2k command");
+    } catch (Exception e) {
+        LOGGER.warn("[Arclight-J2K] Failed to register /j2k command: {}", e.getMessage());
+    }
+}
 }

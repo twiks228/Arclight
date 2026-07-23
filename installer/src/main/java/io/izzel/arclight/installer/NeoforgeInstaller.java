@@ -33,45 +33,101 @@ public class NeoforgeInstaller {
 
     private static final MethodHandles.Lookup IMPL_LOOKUP = Unsafe.lookup();
 
-    @SuppressWarnings("unused")
-    public static Map.Entry<String, List<String>> applicationInstall() throws Throwable {
-        InputStream stream = ForgeInstaller.class.getResourceAsStream("/META-INF/installer.json");
-        InstallInfo installInfo = new Gson().fromJson(new InputStreamReader(stream), InstallInfo.class);
-        List<Supplier<Path>> suppliers = MinecraftProvider.checkMavenNoSource(installInfo.libraries);
-        var sysType = File.pathSeparatorChar == ';' ? "win" : "unix";
-        Path path = Paths.get("libraries", "net", "neoforged", "neoforge", installInfo.installer.neoforge, sysType + "_args.txt");
-        var installForge = !Files.exists(path) || forgeClasspathMissing(path);
-        if (!suppliers.isEmpty() || installForge) {
-            System.out.println("Downloading missing libraries ...");
-            ExecutorService pool = Executors.newWorkStealingPool(8);
-            CompletableFuture<?>[] array = suppliers.stream().map(MinecraftProvider.reportSupply(pool, System.out::println)).toArray(CompletableFuture[]::new);
-            if (installForge) {
-                var futures = installForge(installInfo, pool, System.out::println);
-                MinecraftProvider.handleFutures(System.out::println, futures);
-                System.out.println("Forge installation is starting, please wait... ");
-                try {
-                    ProcessBuilder builder = new ProcessBuilder();
-                    File file = new File(System.getProperty("java.home"), "bin/java");
-                    builder.command(file.getCanonicalPath(), "-Djava.net.useSystemProxies=true", "-jar", futures[0].join().toString(), "--installServer", ".", "--debug");
-                    builder.inheritIO();
-                    Process process = builder.start();
-                    if (process.waitFor() > 0) {
-                        throw new Exception("Forge installation failed");
-                    }
-                } catch (IOException e) {
-                    try (URLClassLoader loader = new URLClassLoader(
-                        new URL[]{futures[0].join().toUri().toURL()},
-                        ForgeInstaller.class.getClassLoader().getParent())) {
-                        Method method = loader.loadClass("net.minecraftforge.installer.SimpleInstaller").getMethod("main", String[].class);
-                        method.invoke(null, (Object) new String[]{"--installServer", ".", "--debug"});
-                    }
+   @SuppressWarnings("unused")
+public static Map.Entry<String, List<String>> applicationInstall() throws Throwable {
+    InputStream stream = ForgeInstaller.class.getResourceAsStream("/META-INF/installer.json");
+    InstallInfo installInfo = new Gson().fromJson(
+        new InputStreamReader(stream), InstallInfo.class
+    );
+
+    // Print installer startup banner using ASCII only to avoid encoding issues
+    System.out.println();
+    System.out.println("+==================================================+");
+    System.out.println("|          Arclight J2K  -  Installer              |");
+    System.out.println("+==================================================+");
+    System.out.printf ("|  Minecraft  : %-35s|%n", installInfo.installer.minecraft);
+    System.out.printf ("|  NeoForge   : %-35s|%n", installInfo.installer.neoforge);
+    System.out.printf ("|  Java       : %-35s|%n", System.getProperty("java.version"));
+    System.out.printf ("|  WorkDir    : %-35s|%n", truncate(System.getProperty("user.dir"), 35));
+    System.out.println("+--------------------------------------------------+");
+    System.out.println("|  Active Maven repositories:                      |");
+    for (String repo : Mirrors.getMavenRepo()) {
+        System.out.printf("|    - %-45s|%n", truncate(repo, 45));
+    }
+    System.out.println("+==================================================+");
+    System.out.println();
+
+    List<Supplier<Path>> suppliers = MinecraftProvider.checkMavenNoSource(
+        installInfo.libraries
+    );
+
+    var sysType = File.pathSeparatorChar == ';' ? "win" : "unix";
+    Path path = Paths.get(
+        "libraries", "net", "neoforged", "neoforge",
+        installInfo.installer.neoforge,
+        sysType + "_args.txt"
+    );
+
+    var installForge = !Files.exists(path) || forgeClasspathMissing(path);
+
+    if (!suppliers.isEmpty() || installForge) {
+        System.out.println("Downloading missing libraries...");
+        ExecutorService pool = Executors.newWorkStealingPool(8);
+
+        CompletableFuture<?>[] array = suppliers.stream()
+            .map(MinecraftProvider.reportSupply(pool, System.out::println))
+            .toArray(CompletableFuture[]::new);
+
+        if (installForge) {
+            System.out.println("Installing NeoForge " +
+                installInfo.installer.neoforge + "...");
+            var futures = installForge(installInfo, pool, System.out::println);
+            MinecraftProvider.handleFutures(System.out::println, futures);
+            System.out.println("NeoForge installation starting, please wait...");
+            try {
+                ProcessBuilder builder = new ProcessBuilder();
+                File file = new File(System.getProperty("java.home"), "bin/java");
+                builder.command(
+                    file.getCanonicalPath(),
+                    "-Djava.net.useSystemProxies=true",
+                    "-jar", futures[0].join().toString(),
+                    "--installServer", ".", "--debug"
+                );
+                builder.inheritIO();
+                Process process = builder.start();
+                if (process.waitFor() > 0) {
+                    throw new Exception("NeoForge installation failed");
+                }
+            } catch (IOException e) {
+                try (URLClassLoader loader = new URLClassLoader(
+                    new URL[]{futures[0].join().toUri().toURL()},
+                    ForgeInstaller.class.getClassLoader().getParent()
+                )) {
+                    Method method = loader
+                        .loadClass("net.minecraftforge.installer.SimpleInstaller")
+                        .getMethod("main", String[].class);
+                    method.invoke(null, (Object) new String[]{
+                        "--installServer", ".", "--debug"
+                    });
                 }
             }
-            MinecraftProvider.handleFutures(System.out::println, array);
-            pool.shutdownNow();
         }
-        return classpath(path, installInfo);
+
+        MinecraftProvider.handleFutures(System.out::println, array);
+        pool.shutdownNow();
+    } else {
+        System.out.println("All libraries present, skipping download.");
     }
+
+    return classpath(path, installInfo);
+}
+
+// Truncates a string to fit within the banner column width
+private static String truncate(String s, int maxLen) {
+    if (s == null) return "";
+    return s.length() <= maxLen ? s : "..." + s.substring(s.length() - (maxLen - 3));
+}
+
 
     @SuppressWarnings("unchecked")
     private static CompletableFuture<Path>[] installForge(InstallInfo info, ExecutorService pool, Consumer<String> logger) {

@@ -42,15 +42,29 @@ allprojects {
     }
 
     repositories {
-        maven { url = 'https://repo.spongepowered.org/maven' }
-        maven { url = 'https://oss.sonatype.org/content/repositories/snapshots/' }
-        maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
-        maven { url = 'https://maven.neoforged.net/releases' }
-        maven { url = 'https://files.minecraftforge.net/maven/' }
-        maven { url = 'https://maven.izzel.io/releases' }
-        mavenCentral()
-        mavenLocal()
-    }
+    // Maven Central first — most standard artifacts are here and it is reliable
+    mavenCentral()
+
+    // NeoForge official — required for NeoForge and FML artifacts
+    maven { url = 'https://maven.neoforged.net/releases' }
+
+    // Forge Maven — required for legacy Forge artifacts
+    maven { url = 'https://files.minecraftforge.net/maven/' }
+
+    // Izzel releases — required for Arclight-specific artifacts
+    maven { url = 'https://maven.izzel.io/releases' }
+
+    // SpigotMC snapshots — required for Spigot API snapshots
+    maven { url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }
+
+    // Sonatype snapshots — fallback for snapshot artifacts
+    maven { url = 'https://oss.sonatype.org/content/repositories/snapshots/' }
+
+    // Sponge Maven — last because it is slow and incomplete
+    maven { url = 'https://repo.spongepowered.org/maven' }
+
+    mavenLocal()
+}
 
     dependencies {
         compileOnly libs.lombok
