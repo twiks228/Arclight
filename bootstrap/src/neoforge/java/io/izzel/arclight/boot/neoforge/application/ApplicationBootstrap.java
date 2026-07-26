@@ -15,28 +15,25 @@ import java.util.function.Consumer;
 
 public class ApplicationBootstrap implements Consumer<String[]>, AbstractBootstrap {
 
-    private static final int MIN_DEPRECATED_VERSION = 60;
+    private static final int MIN_DEPRECATED_VERSION    = 60;
     private static final int MIN_DEPRECATED_JAVA_VERSION = 16;
-
-    // Версии - берём из системных свойств которые ставит NeoForge/Arclight
-    // Если не найдены - берём дефолтные значения из libs.versions.toml
-    private static final String NEOFORGE_VERSION =
-        System.getProperty("arclight.neoforge.version", "21.1.228");
-    private static final String MINECRAFT_VERSION =
-        System.getProperty("arclight.minecraft.version", "1.21.1");
 
     @Override
     @SuppressWarnings("unchecked")
     public void accept(String[] args) {
-        System.setProperty("java.util.logging.manager", "org.apache.logging.log4j.jul.LogManager");
-        System.setProperty("log4j.jul.LoggerAdapter", "io.izzel.arclight.boot.log.ArclightLoggerAdapter");
+        System.setProperty("java.util.logging.manager",
+            "org.apache.logging.log4j.jul.LogManager");
+        System.setProperty("log4j.jul.LoggerAdapter",
+            "io.izzel.arclight.boot.log.ArclightLoggerAdapter");
         System.setProperty("log4j.configurationFile", "arclight-log4j2.xml");
+
         ArclightLocale.info("i18n.using-language",
             ArclightConfig.spec().getLocale().getCurrent(),
             ArclightConfig.spec().getLocale().getFallback());
 
         try {
-            int javaVersion = (int) Float.parseFloat(System.getProperty("java.class.version"));
+            int javaVersion = (int) Float.parseFloat(
+                System.getProperty("java.class.version"));
             if (javaVersion < MIN_DEPRECATED_VERSION) {
                 ArclightLocale.error("java.deprecated",
                     System.getProperty("java.version"), MIN_DEPRECATED_JAVA_VERSION);
@@ -50,38 +47,47 @@ public class ApplicationBootstrap implements Consumer<String[]>, AbstractBootstr
         }
 
         try {
-            // 1. Стандартная инициализация Arclight (без изменений)
+            // 1. Standard Arclight initialization
             this.setupMod(ArclightPlatform.NEOFORGE);
             this.dirtyHacks();
 
-            // 2. ★ НОВОЕ: Ранняя диагностика системы (до загрузки модов)
-            StartupDiagnostics.printEarlyDiagnostics(NEOFORGE_VERSION, MINECRAFT_VERSION);
+            // 2. Read actual NeoForge and Minecraft versions from FML launch args.
+            // FML passes them as: --fml.neoForgeVersion 21.1.236 --fml.mcVersion 1.21.1
+            String neoforgeVersion = extractArg(args, "--fml.neoForgeVersion", "21.1.x");
+            String minecraftVersion = extractArg(args, "--fml.mcVersion",      "1.21.1");
 
-            // 3. ★ НОВОЕ: Детектор конфликтов (сканирует mods/ и plugins/)
+            // Store for later use by other components (e.g. /j2k status)
+            System.setProperty("arclight.neoforge.version", neoforgeVersion);
+            System.setProperty("arclight.minecraft.version", minecraftVersion);
+
+            // 3. Print early diagnostics banner (before mods load)
+            StartupDiagnostics.printEarlyDiagnostics(neoforgeVersion, minecraftVersion);
+
+            // 4. Scan mods/ and plugins/ for known conflicts
             ConflictDetector.ScanResult scanResult = ConflictDetector.scan();
 
-            // Если есть критические ошибки - предупреждаем но не останавливаем сервер
-            // (администратор сам решает продолжать или нет)
             if (scanResult.hasErrors()) {
-                ArclightLocale.info("i18n.using-language"); // используем логгер
-                System.err.println("[Arclight-J2K] ❌ Обнаружены критические конфликты (" +
-                    scanResult.errorCount() + ")! Проверьте лог выше.");
-                // Небольшая пауза чтобы администратор увидел предупреждение
+                System.err.println("[Arclight-J2K] Critical conflicts detected ("
+                    + scanResult.errorCount()
+                    + ")! Check the log above before proceeding.");
                 Thread.sleep(2000);
             }
 
-            // 4. Стандартный запуск NeoForge (без изменений)
+            // 5. Standard NeoForge launch (unchanged)
             int targetIndex = Arrays.asList(args).indexOf("--launchTarget");
             if (targetIndex >= 0 && targetIndex < args.length - 1) {
                 args[targetIndex + 1] = "arclightserver";
             }
-            ServiceLoader.load(getClass().getModule().getLayer(), Consumer.class).stream()
+            ServiceLoader.load(getClass().getModule().getLayer(), Consumer.class)
+                    .stream()
                     .filter(it -> !it.type().getName().contains("arclight"))
-                    .findFirst().orElseThrow().get().accept(args);
+                    .findFirst()
+                    .orElseThrow()
+                    .get()
+                    .accept(args);
 
-            // 5. ★ НОВОЕ: Полная диагностика после загрузки всего
-            // (запускаем в отдельном потоке с задержкой, чтобы Paper успел загрузить плагины)
-            scheduleFullDiagnostics(scanResult);
+            // 6. Full diagnostics after server and plugins are ready (5-second delay)
+            scheduleFullDiagnostics(neoforgeVersion, minecraftVersion);
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -90,33 +96,36 @@ public class ApplicationBootstrap implements Consumer<String[]>, AbstractBootstr
     }
 
     /**
-     * Запускает полную диагностику через 5 секунд после старта сервера.
-     * К этому моменту Paper уже загрузил плагины и мы можем их посчитать.
+     * Schedules full diagnostics to run 5 seconds after startup.
+     * By that time Paper has finished loading all plugins.
      */
-    private void scheduleFullDiagnostics(ConflictDetector.ScanResult scanResult) {
-        Thread diagnosticsThread = new Thread(() -> {
+    private void scheduleFullDiagnostics(String neoforgeVersion, String minecraftVersion) {
+        Thread thread = new Thread(() -> {
             try {
-                // Ждём пока сервер полностью запустится
                 Thread.sleep(5000);
-
-                // Считаем моды и плагины по файлам (простой вариант)
-                int modCount = StartupDiagnostics.countModFiles();
+                int modCount    = StartupDiagnostics.countModFiles();
                 int pluginCount = StartupDiagnostics.countPluginFiles();
-
                 StartupDiagnostics.printDiagnostics(
-                    NEOFORGE_VERSION,
-                    MINECRAFT_VERSION,
-                    modCount,
-                    pluginCount
-                );
-
+                    neoforgeVersion, minecraftVersion, modCount, pluginCount);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }, "Arclight-J2K-Diagnostics");
 
-        // Daemon поток - не мешает остановке сервера
-        diagnosticsThread.setDaemon(true);
-        diagnosticsThread.start();
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /**
+     * Extracts a named argument value from the launch args array.
+     * Example: extractArg(args, "--fml.neoForgeVersion", "unknown") → "21.1.236"
+     */
+    private static String extractArg(String[] args, String name, String defaultValue) {
+        for (int i = 0; i < args.length - 1; i++) {
+            if (name.equals(args[i])) {
+                return args[i + 1];
+            }
+        }
+        return defaultValue;
     }
 }
