@@ -29,6 +29,7 @@
     "world.level.material.FlowingFluidMixin",
     "world.level.material.LavaFluidMixin",
     "nbt.CompoundTagMixin",
+    "nbt.CompoundTagMixin_Concurrency",
     "network.ConnectionMixin",
     "server.network.ServerCommonPacketListenerImplMixin",
     "server.network.ServerConfigurationPacketListenerImplMixin",
