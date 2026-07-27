@@ -67,7 +67,7 @@ import java.util.stream.Stream;
  *   <li>Scaled health injection into attribute send packets</li>
  * </ul>
  */
-@Mixin(value = ServerEntity.class, priority = 1100)
+@Mixin(ServerEntity.class)
 public abstract class ServerEntityMixin implements ServerEntityBridge {
 
     // @formatter:off
