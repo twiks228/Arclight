@@ -19,8 +19,13 @@ public class CraftItemFactoryMixin {
     @Inject(method = "getItemMeta*", require = 0, expect = 0, cancellable = true, at = @At("HEAD"))
     private void arclight$getItemMeta(Material material, CraftMetaItem meta, CallbackInfoReturnable<ItemMeta> cir) {
         MaterialBridge bridge = (MaterialBridge) (Object) CraftLegacy.fromLegacy(material);
-        if (bridge.bridge$getType() != MaterialPropertySpec.MaterialType.VANILLA) {
-            cir.setReturnValue(bridge.bridge$itemMetaFactory().apply(meta));
+        
+        // Проверяем, является ли материал модовым
+        if (bridge != null && bridge.bridge$getType() != MaterialPropertySpec.MaterialType.VANILLA) {
+            ItemMeta customMeta = bridge.bridge$itemMetaFactory().apply(meta);
+            if (customMeta != null) {
+                cir.setReturnValue(customMeta);
+            }
         }
     }
 }

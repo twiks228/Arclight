@@ -65,9 +65,30 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
-@Mixin(ServerLoginPacketListenerImpl.class)
-public abstract class ServerLoginPacketListenerImplMixin implements ServerLoginPacketListenerImplBridge, CraftPlayer.TransferCookieConnection {
+/**
+ * Mixin for {@link ServerLoginPacketListenerImpl} that integrates Bukkit's
+ * login event pipeline and proxy forwarding support.
+ *
+ * <p>Login flow:</p>
+ * <ol>
+ *   <li>{@link #handleHello} — receives client hello, initiates auth or offline login</li>
+ *   <li>{@link #handleKey} — (online mode) verifies encryption and authenticates with Mojang</li>
+ *   <li>{@link #bridge$preLogin} — fires Bukkit pre-login events</li>
+ *   <li>{@code startClientVerification} → configuration phase</li>
+ * </ol>
+ *
+ * <p>Supports three proxy forwarding modes:</p>
+ * <ul>
+ *   <li><b>None</b> — standard Mojang authentication</li>
+ *   <li><b>BungeeCord</b> — hostname-based UUID/profile injection (legacy)</li>
+ *   <li><b>Velocity</b> — plugin channel-based modern forwarding</li>
+ * </ul>
+ */
+@Mixin(value = ServerLoginPacketListenerImpl.class, priority = 1100)
+public abstract class ServerLoginPacketListenerImplMixin
+        implements ServerLoginPacketListenerImplBridge, CraftPlayer.TransferCookieConnection {
 
     // @formatter:off
     @Shadow private ServerLoginPacketListenerImpl.State state;
@@ -79,16 +100,31 @@ public abstract class ServerLoginPacketListenerImplMixin implements ServerLoginP
     @Shadow public abstract String getUserName();
     @Shadow @Final private byte[] challenge;
     @Shadow @Nullable private String requestedUsername;
-    @Shadow abstract void startClientVerification(GameProfile p_301095_);
-    @Shadow protected abstract boolean isPlayerAlreadyInWorld(GameProfile p_298499_);
+    @Shadow abstract void startClientVerification(GameProfile profile);
+    @Shadow protected abstract boolean isPlayerAlreadyInWorld(GameProfile profile);
     @Shadow @Nullable private GameProfile authenticatedProfile;
     @Shadow @Final private boolean transferred;
     // @formatter:on
 
-    private static final java.util.regex.Pattern PROP_PATTERN = java.util.regex.Pattern.compile("\\w{0,16}");
+    // ── Constants ─────────────────────────────────────────────────────────────
 
+    /**
+     * Regex for validating property names in spoofed game profiles.
+     * Only word characters (letters, digits, underscore) up to 16 chars.
+     */
+    @Unique
+    private static final Pattern PROP_PATTERN = Pattern.compile("\\w{0,16}");
+
+    // ── State ─────────────────────────────────────────────────────────────────
+
+    /** The Bukkit player entity created during login validation. */
     private ServerPlayer player;
-    @Unique protected int arclight$velocityLoginId = -1;
+
+    /** Transaction ID for Velocity modern forwarding, or -1 if not using Velocity. */
+    @Unique
+    protected int arclight$velocityLoginId = -1;
+
+    // ── Bridge implementation ─────────────────────────────────────────────────
 
     @Override
     public int bridge$getVelocityLoginId() {
@@ -100,284 +136,488 @@ public abstract class ServerLoginPacketListenerImplMixin implements ServerLoginP
         this.disconnect(Component.literal(s));
     }
 
-    public void disconnect(final String s) {
+    public void disconnect(String s) {
         bridge$disconnect(s);
     }
 
+    // ── Hello handler ─────────────────────────────────────────────────────────
+
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Overwritten to integrate Bukkit pre-login events, BungeeCord/Velocity
+     * forwarding, and offline-mode profile creation into the login flow.
      */
     @Overwrite
     public void handleHello(ServerboundHelloPacket packetIn) {
-        Validate.validState(this.state == ServerLoginPacketListenerImpl.State.HELLO, "Unexpected hello packet");
-        Validate.validState(StringUtil.isValidPlayerName(packetIn.name()), "Invalid characters in username");
+        Validate.validState(
+            this.state == ServerLoginPacketListenerImpl.State.HELLO,
+            "Unexpected hello packet"
+        );
+        Validate.validState(
+            StringUtil.isValidPlayerName(packetIn.name()),
+            "Invalid characters in username"
+        );
+
         this.requestedUsername = packetIn.name();
-        GameProfile gameprofile = this.server.getSingleplayerProfile();
-        if (gameprofile != null && this.requestedUsername.equalsIgnoreCase(gameprofile.getName())) {
-            this.startClientVerification(gameprofile);
-        } else {
-            if (this.server.usesAuthentication() && !this.connection.isMemoryConnection()) {
-                this.state = ServerLoginPacketListenerImpl.State.KEY;
-                this.connection.send(new ClientboundHelloPacket("", this.server.getKeyPair().getPublic().getEncoded(), this.challenge, true));
-            } else {
-                if (VelocitySupport.isEnabled()) {
-                    this.arclight$velocityLoginId = ThreadLocalRandom.current().nextInt();
-                    var packet = new ClientboundCustomQueryPacket(this.arclight$velocityLoginId, VelocitySupport.createPacket());
-                    this.connection.send(packet);
-                    return;
+        GameProfile singleplayerProfile = this.server.getSingleplayerProfile();
+
+        if (singleplayerProfile != null
+                && this.requestedUsername.equalsIgnoreCase(singleplayerProfile.getName())) {
+            // Singleplayer owner — skip authentication entirely
+            this.startClientVerification(singleplayerProfile);
+            return;
+        }
+
+        if (this.server.usesAuthentication() && !this.connection.isMemoryConnection()) {
+            // Online mode — send encryption request
+            this.state = ServerLoginPacketListenerImpl.State.KEY;
+            this.connection.send(new ClientboundHelloPacket(
+                "", this.server.getKeyPair().getPublic().getEncoded(),
+                this.challenge, true
+            ));
+            return;
+        }
+
+        // Offline mode
+        if (VelocitySupport.isEnabled()) {
+            // Velocity modern forwarding: send a custom query to get player info
+            this.arclight$velocityLoginId = ThreadLocalRandom.current().nextInt();
+            this.connection.send(new ClientboundCustomQueryPacket(
+                this.arclight$velocityLoginId, VelocitySupport.createPacket()
+            ));
+            return;
+        }
+
+        // Standard offline mode: create profile and fire pre-login events
+        Thread thread = bridge$newHandleThread(
+            "User Authenticator #" + UNIQUE_THREAD_ID.incrementAndGet(),
+            () -> {
+                try {
+                    GameProfile profile = arclight$createOfflineProfile(
+                        connection, requestedUsername
+                    );
+                    bridge$preLogin(profile);
+                } catch (Exception ex) {
+                    disconnect(Component.translatable(
+                        "multiplayer.disconnect.unverified_username"
+                    ));
+                    LOGGER.warn("Exception verifying {}", requestedUsername, ex);
                 }
-
-                var thread = bridge$newHandleThread("User Authenticator #" + UNIQUE_THREAD_ID.incrementAndGet(), () -> {
-                    try {
-                        var gameProfile = arclight$createOfflineProfile(connection, requestedUsername);
-                        bridge$preLogin(gameProfile);
-                    } catch (Exception ex) {
-                        disconnect(Component.translatable("multiplayer.disconnect.unverified_username"));
-                        LOGGER.warn("Exception verifying {} ", requestedUsername, ex);
-                    }
-                });
-                thread.setUncaughtExceptionHandler(new DefaultUncaughtExceptionHandler(LOGGER));
-                thread.start();
             }
-        }
-    }
-
-    private static GameProfile arclight$createOfflineProfile(Connection connection, String name) {
-        UUID uuid;
-        if (((ConnectionBridge) connection).bridge$getSpoofedUUID() != null) {
-            uuid = ((ConnectionBridge) connection).bridge$getSpoofedUUID();
-        } else {
-            uuid = UUIDUtil.createOfflinePlayerUUID(name);
-        }
-
-        GameProfile gameProfile = new GameProfile(uuid, name);
-
-        if (((ConnectionBridge) connection).bridge$getSpoofedProfile() != null) {
-            Property[] spoofedProfile;
-            for (int length = (spoofedProfile = ((ConnectionBridge) connection).bridge$getSpoofedProfile()).length, i = 0; i < length; ++i) {
-                final Property property = spoofedProfile[i];
-                if (!PROP_PATTERN.matcher(property.name()).matches()) continue;
-                gameProfile.getProperties().put(property.name(), property);
-            }
-        }
-        return gameProfile;
-    }
-
-    @Redirect(method = "verifyLoginAndFinishConnectionSetup", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(Ljava/net/SocketAddress;Lcom/mojang/authlib/GameProfile;)Lnet/minecraft/network/chat/Component;"))
-    private Component arclight$canLogin(PlayerList instance, SocketAddress socketAddress, GameProfile gameProfile) {
-        if (this.player == null) {
-            this.player = ((PlayerListBridge) instance).bridge$canPlayerLogin(socketAddress, gameProfile, (ServerLoginPacketListenerImpl) (Object) this);
-        }
-        return null;
-    }
-
-    @Inject(method = "verifyLoginAndFinishConnectionSetup", cancellable = true, at = @At(value = "INVOKE", shift = At.Shift.AFTER, target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(Ljava/net/SocketAddress;Lcom/mojang/authlib/GameProfile;)Lnet/minecraft/network/chat/Component;"))
-    private void arclight$returnIfFail(GameProfile p_299507_, CallbackInfo ci) {
-        if (this.player == null) {
-            ci.cancel();
-        } else {
-            if (((CraftPlayer) this.player.bridge$getBukkitEntity()).isAwaitingCookies()) {
-                ci.cancel();
-            }
-        }
-    }
-
-    @Redirect(method = "verifyLoginAndFinishConnectionSetup", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/players/PlayerList;disconnectAllPlayersWithProfile(Lcom/mojang/authlib/GameProfile;)Z"))
-    private boolean arclight$skipKick(PlayerList instance, GameProfile gameProfile) {
-        return this.isPlayerAlreadyInWorld(Objects.requireNonNull(this.authenticatedProfile));
-    }
-
-    @Inject(method = "handleLoginAcknowledgement", at = @At("HEAD"))
-    private void arclight$mainThreadConfiguration(ServerboundLoginAcknowledgedPacket serverboundLoginAcknowledgedPacket, CallbackInfo ci) {
-        PacketUtils.ensureRunningOnSameThread(serverboundLoginAcknowledgedPacket, (ServerLoginPacketListenerImpl) (Object) this, this.server);
-    }
-
-    @Inject(method = "handleLoginAcknowledgement", locals = LocalCapture.CAPTURE_FAILHARD, at = @At(value = "INVOKE", target = "Lnet/minecraft/network/Connection;setupInboundProtocol(Lnet/minecraft/network/ProtocolInfo;Lnet/minecraft/network/PacketListener;)V"))
-    private void arclight$setPlayer(ServerboundLoginAcknowledgedPacket p_298815_, CallbackInfo ci, CommonListenerCookie cookie, ServerConfigurationPacketListenerImpl listener) {
-        ((ServerCommonPacketListenerImplBridge) listener).bridge$setPlayer(this.player);
-    }
-
-    @Inject(method = "handleCookieResponse", cancellable = true, at = @At("HEAD"))
-    private void arclight$cookieResponse(ServerboundCookieResponsePacket packet, CallbackInfo ci) {
-        PacketUtils.ensureRunningOnSameThread(packet, (ServerLoginPacketListenerImpl) (Object) this, this.server);
-        if (this.player != null && ((CraftPlayer) this.player.bridge$getBukkitEntity()).handleCookieResponse(packet)) {
-            ci.cancel();
-        }
-    }
-
-    /**
-     * @author IzzelAliz
-     * @reason
-     */
-    @Overwrite
-    public void handleKey(ServerboundKeyPacket packetIn) {
-        Validate.validState(this.state == ServerLoginPacketListenerImpl.State.KEY, "Unexpected key packet");
-
-        final String s;
-        try {
-            PrivateKey privatekey = this.server.getKeyPair().getPrivate();
-            if (!packetIn.isChallengeValid(this.challenge, privatekey)) {
-                throw new IllegalStateException("Protocol error");
-            }
-
-            SecretKey secretKey = packetIn.getSecretKey(privatekey);
-            Cipher cipher = Crypt.getCipher(2, secretKey);
-            Cipher cipher1 = Crypt.getCipher(1, secretKey);
-            s = (new BigInteger(Crypt.digestData("", this.server.getKeyPair().getPublic(), secretKey))).toString(16);
-            this.state = ServerLoginPacketListenerImpl.State.AUTHENTICATING;
-            this.connection.setEncryptionKey(cipher, cipher1);
-        } catch (CryptException cryptexception) {
-            throw new IllegalStateException("Protocol error", cryptexception);
-        }
-
-        var thread = bridge$newHandleThread("User Authenticator #" + UNIQUE_THREAD_ID.incrementAndGet(), () -> {
-            String name = Objects.requireNonNull(requestedUsername, "Player name not initialized");
-
-            try {
-                SocketAddress socketaddress = connection.getRemoteAddress();
-                var address = server.getPreventProxyConnections() && socketaddress instanceof InetSocketAddress ? ((InetSocketAddress) socketaddress).getAddress() : null;
-
-                var profileResult = server.getSessionService().hasJoinedServer(name, s, address);
-                if (profileResult != null) {
-                    var gameProfile = profileResult.profile();
-                    if (!connection.isConnected()) {
-                        return;
-                    }
-                    bridge$preLogin(gameProfile);
-                } else if (server.isSingleplayer()) {
-                    LOGGER.warn("Failed to verify username but will let them in anyway!");
-                    startClientVerification(arclight$createOfflineProfile(connection, name));
-                } else {
-                    disconnect(Component.translatable("multiplayer.disconnect.unverified_username"));
-                    LOGGER.error("Username '{}' tried to join with an invalid session", name);
-                }
-            } catch (AuthenticationException e) {
-                if (server.isSingleplayer()) {
-                    LOGGER.warn("Authentication servers are down but will let them in anyway!");
-                    startClientVerification(arclight$createOfflineProfile(connection, name));
-                } else {
-                    disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
-                    LOGGER.error("Couldn't verify username because servers are unavailable");
-                }
-            } catch (Exception e) {
-                disconnect(Component.translatable("multiplayer.disconnect.unverified_username"));
-                LOGGER.error("Exception verifying " + name, e);
-            }
-        });
+        );
         thread.setUncaughtExceptionHandler(new DefaultUncaughtExceptionHandler(LOGGER));
         thread.start();
     }
 
+    // ── Offline profile creation ──────────────────────────────────────────────
+
+    /**
+     * Creates an offline-mode {@link GameProfile} using either the BungeeCord-spoofed
+     * UUID or a deterministic offline UUID derived from the player name.
+     *
+     * <p>If BungeeCord has provided spoofed profile properties (e.g., skin data),
+     * they are copied into the profile after filtering invalid property names.</p>
+     *
+     * @param connection the network connection (may contain spoofed data)
+     * @param name       the player's requested username
+     * @return the constructed offline game profile
+     */
+    @Unique
+    private static GameProfile arclight$createOfflineProfile(Connection connection, String name) {
+        ConnectionBridge bridge = (ConnectionBridge) connection;
+
+        UUID uuid = (bridge.bridge$getSpoofedUUID() != null)
+            ? bridge.bridge$getSpoofedUUID()
+            : UUIDUtil.createOfflinePlayerUUID(name);
+
+        GameProfile profile = new GameProfile(uuid, name);
+
+        // Copy spoofed properties from BungeeCord (skin, cape, etc.)
+        Property[] spoofedProperties = bridge.bridge$getSpoofedProfile();
+        if (spoofedProperties != null) {
+            for (Property property : spoofedProperties) {
+                if (PROP_PATTERN.matcher(property.name()).matches()) {
+                    profile.getProperties().put(property.name(), property);
+                }
+            }
+        }
+
+        return profile;
+    }
+
+    // ── Login verification ────────────────────────────────────────────────────
+
+    /**
+     * Redirects the vanilla login check to use Arclight's extended
+     * {@link PlayerListBridge#bridge$canPlayerLogin} which creates
+     * the Bukkit player entity and fires login events.
+     */
+    @Redirect(
+        method = "verifyLoginAndFinishConnectionSetup",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(" +
+                     "Ljava/net/SocketAddress;Lcom/mojang/authlib/GameProfile;" +
+                     ")Lnet/minecraft/network/chat/Component;"
+        )
+    )
+    private Component arclight$canLogin(
+            PlayerList instance, SocketAddress address, GameProfile profile) {
+        if (this.player == null) {
+            this.player = ((PlayerListBridge) instance).bridge$canPlayerLogin(
+                address, profile,
+                (ServerLoginPacketListenerImpl) (Object) this
+            );
+        }
+        return null; // Login check result is handled via player being null or not
+    }
+
+    /**
+     * Cancels login if the Bukkit player creation/validation failed,
+     * or if the player is awaiting cookie responses.
+     */
+    @Inject(
+        method = "verifyLoginAndFinishConnectionSetup",
+        cancellable = true,
+        at = @At(
+            value = "INVOKE",
+            shift = At.Shift.AFTER,
+            target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(" +
+                     "Ljava/net/SocketAddress;Lcom/mojang/authlib/GameProfile;" +
+                     ")Lnet/minecraft/network/chat/Component;"
+        )
+    )
+    private void arclight$returnIfFail(GameProfile profile, CallbackInfo ci) {
+        if (this.player == null) {
+            ci.cancel();
+        } else if (((CraftPlayer) this.player.bridge$getBukkitEntity()).isAwaitingCookies()) {
+            ci.cancel();
+        }
+    }
+
+    /**
+     * Skips the vanilla "disconnect all players with same profile" logic.
+     * Arclight handles this via {@link #isPlayerAlreadyInWorld} instead,
+     * which correctly handles the configuration→game transition.
+     */
+    @Redirect(
+        method = "verifyLoginAndFinishConnectionSetup",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/players/PlayerList;disconnectAllPlayersWithProfile(" +
+                     "Lcom/mojang/authlib/GameProfile;)Z"
+        )
+    )
+    private boolean arclight$skipKick(PlayerList instance, GameProfile profile) {
+        return this.isPlayerAlreadyInWorld(
+            Objects.requireNonNull(this.authenticatedProfile)
+        );
+    }
+
+    // ── Login acknowledgement ─────────────────────────────────────────────────
+
+    /**
+     * Ensures the login acknowledgement packet is processed on the main thread.
+     * This is critical because the configuration phase setup is not thread-safe.
+     */
+    @Inject(method = "handleLoginAcknowledgement", at = @At("HEAD"))
+    private void arclight$mainThreadConfiguration(
+            ServerboundLoginAcknowledgedPacket packet, CallbackInfo ci) {
+        PacketUtils.ensureRunningOnSameThread(
+            packet, (ServerLoginPacketListenerImpl) (Object) this, this.server
+        );
+    }
+
+    /**
+     * Passes the Bukkit player entity to the newly created configuration listener,
+     * preserving state from the login phase.
+     */
+    @Inject(
+        method = "handleLoginAcknowledgement",
+        locals = LocalCapture.CAPTURE_FAILHARD,
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/network/Connection;setupInboundProtocol(" +
+                     "Lnet/minecraft/network/ProtocolInfo;" +
+                     "Lnet/minecraft/network/PacketListener;)V"
+        )
+    )
+    private void arclight$setPlayer(
+            ServerboundLoginAcknowledgedPacket packet,
+            CallbackInfo ci,
+            CommonListenerCookie cookie,
+            ServerConfigurationPacketListenerImpl listener) {
+        ((ServerCommonPacketListenerImplBridge) listener).bridge$setPlayer(this.player);
+    }
+
+    // ── Cookie response ───────────────────────────────────────────────────────
+
+    @Inject(method = "handleCookieResponse", cancellable = true, at = @At("HEAD"))
+    private void arclight$cookieResponse(
+            ServerboundCookieResponsePacket packet, CallbackInfo ci) {
+        PacketUtils.ensureRunningOnSameThread(
+            packet, (ServerLoginPacketListenerImpl) (Object) this, this.server
+        );
+        if (this.player != null
+                && ((CraftPlayer) this.player.bridge$getBukkitEntity()).handleCookieResponse(packet)) {
+            ci.cancel();
+        }
+    }
+
+    // ── Encryption key handler ────────────────────────────────────────────────
+
+    /**
+     * @author IzzelAliz
+     * @reason Overwritten to integrate Bukkit pre-login events into the
+     * Mojang authentication flow and handle offline fallback for singleplayer.
+     */
+    @Overwrite
+    public void handleKey(ServerboundKeyPacket packetIn) {
+        Validate.validState(
+            this.state == ServerLoginPacketListenerImpl.State.KEY,
+            "Unexpected key packet"
+        );
+
+        final String serverId;
+        try {
+            PrivateKey privateKey = this.server.getKeyPair().getPrivate();
+            if (!packetIn.isChallengeValid(this.challenge, privateKey)) {
+                throw new IllegalStateException("Protocol error");
+            }
+
+            SecretKey secretKey = packetIn.getSecretKey(privateKey);
+            Cipher decryptCipher = Crypt.getCipher(2, secretKey);
+            Cipher encryptCipher = Crypt.getCipher(1, secretKey);
+
+            serverId = new BigInteger(
+                Crypt.digestData("", this.server.getKeyPair().getPublic(), secretKey)
+            ).toString(16);
+
+            this.state = ServerLoginPacketListenerImpl.State.AUTHENTICATING;
+            this.connection.setEncryptionKey(decryptCipher, encryptCipher);
+        } catch (CryptException e) {
+            throw new IllegalStateException("Protocol error", e);
+        }
+
+        Thread thread = bridge$newHandleThread(
+            "User Authenticator #" + UNIQUE_THREAD_ID.incrementAndGet(),
+            () -> {
+                String name = Objects.requireNonNull(requestedUsername, "Player name not initialized");
+                try {
+                    // Check if the proxy prevention requires IP verification
+                    SocketAddress remoteAddress = connection.getRemoteAddress();
+                    InetAddress verifyAddress = (server.getPreventProxyConnections()
+                        && remoteAddress instanceof InetSocketAddress inet)
+                        ? inet.getAddress()
+                        : null;
+
+                    var profileResult = server.getSessionService()
+                        .hasJoinedServer(name, serverId, verifyAddress);
+
+                    if (profileResult != null) {
+                        GameProfile profile = profileResult.profile();
+                        if (!connection.isConnected()) return;
+                        bridge$preLogin(profile);
+                    } else if (server.isSingleplayer()) {
+                        LOGGER.warn("Failed to verify username but will let them in anyway!");
+                        startClientVerification(arclight$createOfflineProfile(connection, name));
+                    } else {
+                        disconnect(Component.translatable(
+                            "multiplayer.disconnect.unverified_username"
+                        ));
+                        LOGGER.error("Username '{}' tried to join with an invalid session", name);
+                    }
+                } catch (AuthenticationException e) {
+                    if (server.isSingleplayer()) {
+                        LOGGER.warn("Authentication servers are down but will let them in anyway!");
+                        startClientVerification(arclight$createOfflineProfile(connection, name));
+                    } else {
+                        disconnect(Component.translatable(
+                            "multiplayer.disconnect.authservers_down"
+                        ));
+                        LOGGER.error("Couldn't verify username because servers are unavailable");
+                    }
+                } catch (Exception e) {
+                    disconnect(Component.translatable(
+                        "multiplayer.disconnect.unverified_username"
+                    ));
+                    LOGGER.error("Exception verifying {}", name, e);
+                }
+            }
+        );
+        thread.setUncaughtExceptionHandler(new DefaultUncaughtExceptionHandler(LOGGER));
+        thread.start();
+    }
+
+    // ── Pre-login event pipeline ──────────────────────────────────────────────
+
+    /**
+     * Fires Bukkit's pre-login events ({@link AsyncPlayerPreLoginEvent} and
+     * the deprecated {@link PlayerPreLoginEvent}) and proceeds with client
+     * verification if not rejected.
+     *
+     * <p>If Velocity modern forwarding is enabled but the login did not go
+     * through the Velocity channel, the player is disconnected.</p>
+     *
+     * @param gameProfile the authenticated or offline game profile
+     * @throws Exception if a synchronous event waitable is interrupted
+     */
     @Unique
     public void bridge$preLogin(GameProfile gameProfile) throws Exception {
         if (this.arclight$velocityLoginId == -1 && VelocitySupport.isEnabled()) {
             disconnect("This server requires you to connect with Velocity.");
             return;
         }
-        callPlayerPreLoginEvents(gameProfile);
+        arclight$callPlayerPreLoginEvents(gameProfile);
         LOGGER.info("UUID of player {} is {}", gameProfile.getName(), gameProfile.getId());
         this.startClientVerification(gameProfile);
     }
 
-    private void callPlayerPreLoginEvents(GameProfile profile) throws Exception {
+    /**
+     * Fires both the async and (if handlers are registered) synchronous
+     * pre-login events for the given profile.
+     *
+     * <p>The synchronous event is dispatched to the main server thread via
+     * a {@link Waitable} to ensure thread safety.</p>
+     *
+     * @param profile the player's game profile
+     * @throws Exception if the synchronous waitable throws
+     */
+    @Unique
+    private void arclight$callPlayerPreLoginEvents(GameProfile profile) throws Exception {
         String playerName = profile.getName();
         InetAddress address = ((InetSocketAddress) connection.getRemoteAddress()).getAddress();
         UUID uniqueId = profile.getId();
         CraftServer craftServer = (CraftServer) Bukkit.getServer();
-        AsyncPlayerPreLoginEvent asyncEvent = new AsyncPlayerPreLoginEvent(playerName, address, uniqueId);
-        craftServer.getPluginManager().callEvent(asyncEvent);
-        if (PlayerPreLoginEvent.getHandlerList().getRegisteredListeners().length != 0) {
-            PlayerPreLoginEvent event = new PlayerPreLoginEvent(playerName, address, uniqueId);
-            if (asyncEvent.getResult() != PlayerPreLoginEvent.Result.ALLOWED) {
-                event.disallow(asyncEvent.getResult(), asyncEvent.getKickMessage());
-            }
-            class SyncPreLogin extends Waitable<PlayerPreLoginEvent.Result> {
 
+        // Fire async event first (runs on the auth thread)
+        AsyncPlayerPreLoginEvent asyncEvent = new AsyncPlayerPreLoginEvent(
+            playerName, address, uniqueId
+        );
+        craftServer.getPluginManager().callEvent(asyncEvent);
+
+        // Only fire the deprecated synchronous event if any handlers are registered
+        if (PlayerPreLoginEvent.getHandlerList().getRegisteredListeners().length != 0) {
+            PlayerPreLoginEvent syncEvent = new PlayerPreLoginEvent(
+                playerName, address, uniqueId
+            );
+            if (asyncEvent.getResult() != PlayerPreLoginEvent.Result.ALLOWED) {
+                syncEvent.disallow(asyncEvent.getResult(), asyncEvent.getKickMessage());
+            }
+
+            Waitable<PlayerPreLoginEvent.Result> waitable = new Waitable<>() {
                 @Override
                 protected PlayerPreLoginEvent.Result evaluate() {
-                    craftServer.getPluginManager().callEvent(event);
-                    return event.getResult();
+                    craftServer.getPluginManager().callEvent(syncEvent);
+                    return syncEvent.getResult();
                 }
-            }
-            Waitable<PlayerPreLoginEvent.Result> waitable = new SyncPreLogin();
+            };
+
             ((MinecraftServerBridge) server).bridge$queuedProcess(waitable);
+
             if (waitable.get() != PlayerPreLoginEvent.Result.ALLOWED) {
-                disconnect(event.getKickMessage());
+                disconnect(syncEvent.getKickMessage());
             }
         } else if (asyncEvent.getLoginResult() != AsyncPlayerPreLoginEvent.Result.ALLOWED) {
             disconnect(asyncEvent.getKickMessage());
         }
     }
 
-    /*
-     * Forgified Fabric API (FFAPI) will actively record every custom query and awaits all responses
-     * before we enter the configuration stage. Due to their powerful control on queries we must allow
-     * them to at least have a glance on what they receive.
-     * FFAPI selected its injection point at the HEAD of this method. Thus, we selected INVOKE disconnect
-     * to ensure a defined injection order.
-     * Due to lack of support on custom queries in Forge/NF, FFAPI aggressively deserialize all CustomQA
-     * payload into its own kind; it is thus needed to take special care when processing the payload.
-     * Fallback implementation will log a loud warning and try to serialize the custom payload to recreate
-     * original answer data. This does not work for FFAPI since their payload is a buffer wrapper and has
-     * consumed the buffer by the end of their handler.
-     * See Forge/NF CustomQA deserialization & ArclightCustomQueryAnswerPayload.
-     * See FFAPI compat impl for customQAData & onCustomQA.
+    // ── Velocity custom query handler ─────────────────────────────────────────
+
+    /**
+     * Handles the Velocity modern forwarding response via a custom query answer.
+     *
+     * <p>Validates the HMAC integrity of the forwarding data, extracts the
+     * real client IP and game profile, and proceeds with login.</p>
+     *
+     * <p><b>FFAPI compatibility note:</b> Forgified Fabric API (FFAPI) records
+     * every custom query and awaits all responses before entering configuration.
+     * This handler is injected at INVOKE disconnect to ensure it runs after FFAPI's
+     * HEAD handler, preserving a defined injection order.</p>
+     *
+     * @see VelocitySupport
      */
-    @Inject(method = "handleCustomQueryPacket", cancellable = true, at = @At(value = "INVOKE", target = "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;disconnect(Lnet/minecraft/network/chat/Component;)V"))
-    private void arclight$modernForwardReply(ServerboundCustomQueryAnswerPacket packet, CallbackInfo ci) {
-        if (VelocitySupport.isEnabled() && packet.transactionId() == this.bridge$getVelocityLoginId()) {
-            var payload = arclight$platform$customQAData(packet);
-            if (payload == null) {
-                this.bridge$disconnect("This server requires you to connect with Velocity.");
-                ci.cancel();
-                return;
-            }
-            var buf = payload.readNullable(r -> {
-                int i = r.readableBytes();
-                if (i >= 0 && i <= 1048576) {
-                    return new FriendlyByteBuf(r.readBytes(i));
-                } else {
-                    throw new IllegalArgumentException("Payload may not be larger than 1048576 bytes");
-                }
-            });
-            if (buf == null) {
-                this.bridge$disconnect("This server requires you to connect with Velocity.");
-                ci.cancel();
-                return;
-            }
-
-            if (!VelocitySupport.checkIntegrity(buf)) {
-                this.bridge$disconnect("Unable to verify player details");
-                ci.cancel();
-                return;
-            }
-
-            int version = buf.readVarInt();
-            if (version > VelocitySupport.MAX_SUPPORTED_FORWARDING_VERSION) {
-                throw new IllegalStateException("Unsupported forwarding version " + version + ", wanted upto " + VelocitySupport.MAX_SUPPORTED_FORWARDING_VERSION);
-            }
-            java.net.SocketAddress listening = this.connection.getRemoteAddress();
-            int port = 0;
-            if (listening instanceof java.net.InetSocketAddress) {
-                port = ((java.net.InetSocketAddress) listening).getPort();
-            }
-            this.connection.address = new java.net.InetSocketAddress(VelocitySupport.readAddress(buf), port);
-            this.authenticatedProfile = VelocitySupport.createProfile(buf);
-
-            // Proceed with login
-            Util.backgroundExecutor().execute(() -> {
-                try {
-                    this.bridge$preLogin(this.authenticatedProfile);
-                } catch (Exception ex) {
-                    disconnect(Component.translatable("multiplayer.disconnect.unverified_username"));
-                    LOGGER.warn("Exception verifying {} ", this.authenticatedProfile.getName(), ex);
-                }
-            });
-            this.arclight$platform$onCustomQA(packet);
-            ci.cancel();
+    @Inject(
+        method = "handleCustomQueryPacket",
+        cancellable = true,
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;disconnect(Lnet/minecraft/network/chat/Component;)V"
+        )
+    )
+    private void arclight$modernForwardReply(
+            ServerboundCustomQueryAnswerPacket packet, CallbackInfo ci) {
+        if (!VelocitySupport.isEnabled()
+                || packet.transactionId() != this.bridge$getVelocityLoginId()) {
+            return;
         }
+
+        var payload = arclight$platform$customQAData(packet);
+        if (payload == null) {
+            this.bridge$disconnect("This server requires you to connect with Velocity.");
+            ci.cancel();
+            return;
+        }
+
+        var buf = payload.readNullable(r -> {
+            int size = r.readableBytes();
+            if (size < 0 || size > 1048576) {
+                throw new IllegalArgumentException(
+                    "Payload may not be larger than 1048576 bytes"
+                );
+            }
+            return new FriendlyByteBuf(r.readBytes(size));
+        });
+
+        if (buf == null) {
+            this.bridge$disconnect("This server requires you to connect with Velocity.");
+            ci.cancel();
+            return;
+        }
+
+        if (!VelocitySupport.checkIntegrity(buf)) {
+            this.bridge$disconnect("Unable to verify player details");
+            ci.cancel();
+            return;
+        }
+
+        int version = buf.readVarInt();
+        if (version > VelocitySupport.MAX_SUPPORTED_FORWARDING_VERSION) {
+            throw new IllegalStateException(
+                "Unsupported forwarding version " + version
+                + ", wanted up to " + VelocitySupport.MAX_SUPPORTED_FORWARDING_VERSION
+            );
+        }
+
+        // Extract the real client port from the current connection
+        SocketAddress listening = this.connection.getRemoteAddress();
+        int port = (listening instanceof InetSocketAddress inet) ? inet.getPort() : 0;
+
+        // Replace the connection address with the real client address from Velocity
+        this.connection.address = new InetSocketAddress(
+            VelocitySupport.readAddress(buf), port
+        );
+        this.authenticatedProfile = VelocitySupport.createProfile(buf);
+
+        // Proceed with login on the background executor
+        Util.backgroundExecutor().execute(() -> {
+            try {
+                this.bridge$preLogin(this.authenticatedProfile);
+            } catch (Exception ex) {
+                disconnect(Component.translatable(
+                    "multiplayer.disconnect.unverified_username"
+                ));
+                LOGGER.warn("Exception verifying {}",
+                    this.authenticatedProfile.getName(), ex);
+            }
+        });
+
+        this.arclight$platform$onCustomQA(packet);
+        ci.cancel();
     }
+
+    // ── TransferCookieConnection implementation ───────────────────────────────
 
     @Override
     public boolean isTransferred() {

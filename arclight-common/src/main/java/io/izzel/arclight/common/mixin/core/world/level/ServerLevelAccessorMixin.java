@@ -11,9 +11,12 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
 import org.spongepowered.asm.mixin.Shadow;
 
-import java.util.Iterator;
-
-@Mixin(ServerLevelAccessor.class)
+/**
+ * Mixin for the {@link ServerLevelAccessor} interface that overrides
+ * {@code addFreshEntityWithPassengers} to propagate Bukkit spawn reasons
+ * to each passenger entity independently.
+ */
+@Mixin(value = ServerLevelAccessor.class, priority = 1100)
 public interface ServerLevelAccessorMixin extends LevelAccessor, ServerLevelBridge {
 
     // @formatter:off
@@ -27,35 +30,44 @@ public interface ServerLevelAccessorMixin extends LevelAccessor, ServerLevelBrid
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Overwritten to propagate Bukkit CreatureSpawnEvent.SpawnReason
+     * to each passenger entity independently, preventing loss of spawn context.
      */
     @Overwrite
     default void addFreshEntityWithPassengers(Entity entity) {
         if (!DistValidate.isValid((LevelAccessor) this)) {
-            Iterator<Entity> iterator = entity.getSelfAndPassengers().iterator();
-            while (iterator.hasNext()) {
-                Entity next = iterator.next();
-                this.addFreshEntity(next);
+            // Non-real level: add entities directly without spawn reason tracking
+            for (Entity passenger : entity.getSelfAndPassengers().toList()) {
+                this.addFreshEntity(passenger);
             }
             return;
         }
+
+        // Real server level: propagate the current spawn reason to all passengers
         CreatureSpawnEvent.SpawnReason spawnReason = bridge$getAddEntityReason();
-        Iterator<Entity> iterator = entity.getSelfAndPassengers().iterator();
-        while (iterator.hasNext()) {
-            Entity next = iterator.next();
+        for (Entity passenger : entity.getSelfAndPassengers().toList()) {
             bridge$pushAddEntityReason(spawnReason);
-            this.addFreshEntity(next);
+            this.addFreshEntity(passenger);
         }
     }
 
-    default boolean addFreshEntityWithPassengers(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {
-        Iterator<Entity> iterator = entity.getSelfAndPassengers().iterator();
-        while (iterator.hasNext()) {
-            Entity next = iterator.next();
+    /**
+     * Variant of {@code addFreshEntityWithPassengers} with an explicit spawn reason.
+     * Used by world-gen code and custom spawning logic that provides its own reason.
+     *
+     * @param entity the root entity (passengers are also added)
+     * @param reason the Bukkit spawn reason to attach to each entity
+     * @return {@code true} if the root entity was not removed after addition
+     */
+    default boolean addFreshEntityWithPassengers(
+            Entity entity,
+            CreatureSpawnEvent.SpawnReason reason
+    ) {
+        for (Entity passenger : entity.getSelfAndPassengers().toList()) {
             if (DistValidate.isValid((LevelAccessor) this)) {
                 bridge$pushAddEntityReason(reason);
             }
-            this.addFreshEntity(next);
+            this.addFreshEntity(passenger);
         }
         return !entity.isRemoved();
     }

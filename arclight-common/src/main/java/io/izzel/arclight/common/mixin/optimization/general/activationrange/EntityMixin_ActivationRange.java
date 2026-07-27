@@ -19,13 +19,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Entity.class)
 public abstract class EntityMixin_ActivationRange implements EntityBridge_ActivationRange, EntityBridge {
 
-    // @formatter:off
     @Shadow public abstract void refreshDimensions();
     @Shadow public int tickCount;
     @Shadow public abstract Level level();
     @Shadow public abstract AABB getBoundingBox();
     @Shadow public abstract void discard();
-    // @formatter:on
 
     public ActivationRange.ActivationType activationType;
     public boolean defaultActivationState;

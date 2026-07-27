@@ -5,7 +5,12 @@ import net.minecraft.world.entity.AreaEffectCloud;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
-@Mixin(AreaEffectCloud.class)
+/**
+ * Mixin for AreaEffectCloud within the ActivationRange system.
+ * Ensures inactive area effect clouds are still discarded correctly
+ * once their wait time + duration has elapsed.
+ */
+@Mixin(value = AreaEffectCloud.class, priority = 1100)
 public abstract class AreaEffectCloudMixin_ActivationRange extends EntityMixin_ActivationRange {
 
     // @formatter:off
@@ -16,8 +21,17 @@ public abstract class AreaEffectCloudMixin_ActivationRange extends EntityMixin_A
     @Override
     public void inactiveTick() {
         super.inactiveTick();
-        if (this.tickCount >= this.waitTime + this.duration) {
-            this.discard();
+
+        // tickCount is advanced inside super.inactiveTick() -> Entity#inactiveTick()
+        // waitTime — delay before the cloud starts applying effects
+        // duration — how long the cloud persists after waitTime
+        final int totalLifetime = this.waitTime + this.duration;
+
+        if (this.tickCount >= totalLifetime) {
+            // Server is authoritative for entity removal
+            if (!this.level().isClientSide) {
+                this.discard();
+            }
         }
     }
 }

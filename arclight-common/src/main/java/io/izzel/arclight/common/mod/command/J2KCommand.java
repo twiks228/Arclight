@@ -15,8 +15,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.jar.JarFile;
+import java.util.stream.Stream;
 
 /**
  * Arclight J2K - /j2k command.
@@ -27,8 +26,8 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
 
     private static final String PREFIX = "\u00a78[\u00a76J2K\u00a78] \u00a7r";
 
-    // Cached conflict scan result label
-    private static String lastScanSummary = null;
+    // Volatile because it is written by the async scan thread and read by the main thread
+    private static volatile String lastScanSummary = null;
 
     @Override
     public boolean onCommand(
@@ -58,7 +57,7 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
     // ── /j2k status ──────────────────────────────────────────────────────────
 
     private void handleStatus(CommandSender sender) {
-        String neoforgeVer  = System.getProperty("arclight.neoforge.version", "21.1.228");
+        String neoforgeVer = System.getProperty("arclight.neoforge.version", "21.1.236");
         String minecraftVer = System.getProperty("arclight.minecraft.version", "1.21.1");
         String javaVersion  = System.getProperty("java.version", "?");
         String javaVendor   = shortenVendor(System.getProperty("java.vendor", "Unknown"));
@@ -111,25 +110,27 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
                 List<String> pluginNames = getJarNames("plugins");
                 List<String> issues      = new ArrayList<>();
 
-                // Known client-only mods that should not be on server
+                // Known client-only mods that should not be on the server
                 List<String> clientOnly = Arrays.asList(
                     "optifine", "iris", "sodium", "embeddium", "rubidium"
                 );
                 for (String m : modNames) {
+                    String mLower = m.toLowerCase();
                     for (String bad : clientOnly) {
-                        if (m.toLowerCase().contains(bad)) {
+                        if (mLower.contains(bad)) {
                             issues.add("\u00a7c[ERROR] Client-only mod in mods/: " + m);
                         }
                     }
                 }
 
-                // Known plugins placed in wrong folder
+                // Known plugins placed in the wrong folder
                 List<String> pluginsInMods = Arrays.asList(
                     "worldguard", "viaversion", "protocollib", "essentials"
                 );
                 for (String m : modNames) {
+                    String mLower = m.toLowerCase();
                     for (String bad : pluginsInMods) {
-                        if (m.toLowerCase().contains(bad)) {
+                        if (mLower.contains(bad)) {
                             issues.add("\u00a7c[ERROR] Plugin in mods/ folder: " + m
                                 + " \u00a77(move to plugins/)");
                         }
@@ -143,6 +144,7 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
                     for (String plugin : pluginNames) {
                         String pluginKey = plugin.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
                         if (pluginKey.length() < 5) continue;
+                        
                         int len = Math.min(6, Math.min(modKey.length(), pluginKey.length()));
                         if (modKey.substring(0, len).equals(pluginKey.substring(0, len))) {
                             issues.add("\u00a7e[WARN] Possible duplicate: mods/" + mod
@@ -237,8 +239,7 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
             @NotNull String alias,
             @NotNull String[] args) {
         if (args.length == 1) {
-            return Arrays.asList("status", "version", "scan", "memory", "help")
-                .stream()
+            return Stream.of("status", "version", "scan", "memory", "help")
                 .filter(s -> s.startsWith(args[0].toLowerCase()))
                 .toList();
         }
@@ -247,12 +248,16 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    // Counts jar files in a server folder
+    /**
+     * Counts jar files in a server folder.
+     * Uses try-with-resources to prevent file descriptor leaks.
+     */
     private static int countJarsInFolder(String folderName) {
-        try {
-            Path folder = Paths.get(folderName);
-            if (!Files.exists(folder)) return 0;
-            return (int) Files.list(folder)
+        Path folder = Paths.get(folderName);
+        if (!Files.exists(folder)) return 0;
+        
+        try (Stream<Path> stream = Files.list(folder)) {
+            return (int) stream
                 .filter(p -> p.toString().toLowerCase().endsWith(".jar"))
                 .count();
         } catch (IOException e) {
@@ -260,23 +265,26 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
         }
     }
 
-    // Returns list of jar file names (without .jar extension) from a folder
+    /**
+     * Returns a list of jar file names (without .jar extension) from a folder.
+     * Uses try-with-resources to prevent file descriptor leaks.
+     */
     private static List<String> getJarNames(String folderName) {
         List<String> result = new ArrayList<>();
-        try {
-            Path folder = Paths.get(folderName);
-            if (!Files.exists(folder)) return result;
-            Files.list(folder)
-                .filter(p -> p.toString().toLowerCase().endsWith(".jar"))
-                .forEach(p -> {
-                    String name = p.getFileName().toString();
-                    result.add(name.substring(0, name.length() - 4));
-                });
+        Path folder = Paths.get(folderName);
+        if (!Files.exists(folder)) return result;
+        
+        try (Stream<Path> stream = Files.list(folder)) {
+            stream.filter(p -> p.toString().toLowerCase().endsWith(".jar"))
+                  .forEach(p -> {
+                      String name = p.getFileName().toString();
+                      result.add(name.substring(0, name.length() - 4));
+                  });
         } catch (IOException ignored) {}
+        
         return result;
     }
 
-    // Builds a colored progress bar
     private static String buildBar(int pct, int width) {
         int filled = (int) (pct / 100.0 * width);
         String color = pct < 60 ? "\u00a7a" : pct < 85 ? "\u00a7e" : "\u00a7c";
@@ -288,7 +296,6 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
         return bar.toString();
     }
 
-    // Formats uptime seconds to human-readable string
     private static String formatUptime(long seconds) {
         long hours   = seconds / 3600;
         long minutes = (seconds % 3600) / 60;
@@ -298,7 +305,6 @@ public class J2KCommand implements CommandExecutor, TabCompleter {
         return secs + "s";
     }
 
-    // Shortens Java vendor name for display
     private static String shortenVendor(String vendor) {
         if (vendor.contains("Adoptium") || vendor.contains("Eclipse")) return "Adoptium";
         if (vendor.contains("Oracle"))    return "Oracle";

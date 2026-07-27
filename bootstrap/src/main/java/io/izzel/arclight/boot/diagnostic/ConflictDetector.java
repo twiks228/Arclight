@@ -5,7 +5,6 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,71 +15,91 @@ import java.util.jar.JarFile;
 import java.util.jar.Manifest;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
- * Arclight J2K - Smart compatibility checker.
+ * Arclight J2K — Smart compatibility checker.
  *
- * Scans mods/ and plugins/ on startup:
- * - Reads neoforge.mods.toml to extract mod dependencies
- * - Checks required NeoForge version ranges
- * - Detects missing required mods
- * - Detects client-only mods on server
- * - Detects plugins placed in mods/ by mistake
- * - Detects duplicate jars across mods/ and plugins/
+ * <p>Scans {@code mods/} and {@code plugins/} on startup to detect common
+ * configuration problems. Produces a structured {@link ScanResult} that can
+ * be used by the {@code /j2k scan} command and the startup log.</p>
+ *
+ * <p>Checks performed:</p>
+ * <ul>
+ *   <li>NeoForge version range requirements from {@code neoforge.mods.toml}</li>
+ *   <li>Missing required mod dependencies</li>
+ *   <li>Client-only mods placed on the server</li>
+ *   <li>Bukkit plugins accidentally placed in {@code mods/}</li>
+ *   <li>NeoForge mods accidentally placed in {@code plugins/}</li>
+ *   <li>Duplicate jars present in both folders</li>
+ * </ul>
  */
-public class ConflictDetector {
+public final class ConflictDetector {
+
+    private ConflictDetector() {}
 
     private static final Logger LOGGER = LogManager.getLogger("Arclight-J2K-Compat");
 
-    // Pattern for version range check: extract minimum version
-    // e.g. "[21.1.234,)" → "21.1.234"
+    /**
+     * Pattern to extract the minimum version from a Maven version range.
+     * Supports: {@code [21.1.234,)}, {@code [21.1,22)}, etc.
+     */
     private static final Pattern VERSION_RANGE_MIN =
         Pattern.compile("\\[([\\d.]+)");
 
-    // ── Known rules ──────────────────────────────────────────────────────────
+    // ── Known rule sets ───────────────────────────────────────────────────────
 
-    // Client-only mods that should never be on a server
+    /**
+     * Jar name substrings that identify client-only mods.
+     * These mods have no server-side functionality and should never be
+     * placed in a dedicated server's {@code mods/} folder.
+     */
     private static final Set<String> CLIENT_ONLY_MODS = Set.of(
         "optifine", "iris", "sodium", "embeddium", "rubidium",
         "euphoria_patches", "bliss", "complementary"
     );
 
-    // Plugin jar patterns that end up in mods/ by mistake
+    /**
+     * Jar name substrings that identify Bukkit plugins commonly placed
+     * in {@code mods/} by mistake. These should be in {@code plugins/}.
+     */
     private static final Set<String> PLUGIN_NAMES_IN_MODS = Set.of(
         "worldguard", "viaversion", "protocollib", "essentials",
         "luckperms", "coreprotect", "placeholderapi", "authme"
     );
 
-    // ── Entry point ──────────────────────────────────────────────────────────
+    /**
+     * Multi-platform plugin names that may legitimately contain "neoforge"
+     * or "fabric" in their filename while still being valid Bukkit plugins.
+     */
+    private static final Set<String> KNOWN_MULTI_PLATFORM_PLUGINS = Set.of(
+        "tab", "plasmovoice", "captcha", "warning",
+        "fabric-elytra", "interactivechat"
+    );
+
+    // ── Entry point ───────────────────────────────────────────────────────────
 
     /**
-     * Runs the full compatibility scan.
-     * Called from ApplicationBootstrap during startup.
+     * Runs the full compatibility scan and returns a {@link ScanResult}.
+     * Called during server startup to detect configuration problems early.
+     *
+     * @return the scan result containing all detected issues
      */
     public static ScanResult scan() {
         LOGGER.info("[Arclight-J2K] Running compatibility check...");
 
         String currentNeoForge = System.getProperty(
-            "arclight.neoforge.version", "21.1.228");
+    "arclight.neoforge.version", "21.1.236");
 
         List<ModInfo> mods    = scanFolder(Paths.get("mods"));
         List<ModInfo> plugins = scanFolder(Paths.get("plugins"));
 
         List<Issue> issues = new ArrayList<>();
 
-        // Check dependency requirements from mods.toml
         checkModDependencies(mods, currentNeoForge, issues);
-
-        // Check for client-only mods
         checkClientOnlyMods(mods, issues);
-
-        // Check for plugins in mods/ folder
         checkPluginsInModsFolder(mods, issues);
-
-        // Check for suspicious jars in plugins/ that look like mods
         checkModsInPluginsFolder(plugins, issues);
-
-        // Check for duplicate names across both folders
         checkDuplicates(mods, plugins, issues);
 
         printResults(mods, plugins, issues);
@@ -88,42 +107,56 @@ public class ConflictDetector {
         return new ScanResult(mods, plugins, issues);
     }
 
-    // ── Scanners ─────────────────────────────────────────────────────────────
+    // ── Folder scanner ────────────────────────────────────────────────────────
 
-    // Scans a folder and reads basic info from each jar
+    /**
+     * Scans a folder and reads mod metadata from each jar.
+     * Uses try-with-resources to prevent file descriptor leaks.
+     *
+     * @param folder the folder to scan
+     * @return a list of {@link ModInfo} for each jar found
+     */
     private static List<ModInfo> scanFolder(Path folder) {
+        if (!Files.exists(folder)) return List.of();
         List<ModInfo> result = new ArrayList<>();
-        if (!Files.exists(folder)) return result;
-
-        try {
-            Files.list(folder)
-                .filter(p -> p.toString().toLowerCase().endsWith(".jar"))
-                .forEach(jarPath -> {
-                    ModInfo info = readModInfo(jarPath);
-                    if (info != null) result.add(info);
-                });
+        try (Stream<Path> stream = Files.list(folder)) {
+            stream.filter(p -> p.toString().toLowerCase().endsWith(".jar"))
+                  .forEach(jarPath -> {
+                      ModInfo info = readModInfo(jarPath);
+                      if (info != null) result.add(info);
+                  });
         } catch (IOException e) {
             LOGGER.warn("[Arclight-J2K] Cannot scan {}: {}", folder, e.getMessage());
         }
         return result;
     }
 
-    // Reads neoforge.mods.toml and manifest from a jar
+    // ── Jar metadata reader ────────────────────────────────────────────────────
+
+    /**
+     * Reads mod metadata from a jar file, including display name, mod ID,
+     * and declared dependencies from {@code neoforge.mods.toml}.
+     *
+     * @param jarPath the path to the jar file
+     * @return the mod info, or {@code null} if the jar cannot be opened
+     */
     private static ModInfo readModInfo(Path jarPath) {
         String fileName = jarPath.getFileName().toString();
         String baseName = fileName.substring(0, fileName.length() - 4);
 
         try (JarFile jar = new JarFile(jarPath.toFile())) {
-            // Read display name from manifest
+            // Try to get a human-readable display name from the manifest
             String displayName = baseName;
             Manifest manifest = jar.getManifest();
             if (manifest != null) {
                 String title = manifest.getMainAttributes().getValue("Implementation-Title");
-                if (title != null && !title.isBlank()) displayName = title;
+                if (title != null && !title.isBlank()) {
+                    displayName = title;
+                }
             }
 
-            // Read neoforge.mods.toml for dependencies
-            List<ModDependency> deps = new ArrayList<>();
+            // Try to parse neoforge.mods.toml for dependency information
+            List<ModDependency> deps = List.of();
             String modId = baseName.toLowerCase();
 
             JarEntry tomlEntry = jar.getJarEntry("META-INF/neoforge.mods.toml");
@@ -133,8 +166,7 @@ public class ConflictDetector {
 
             if (tomlEntry != null) {
                 try (InputStream is = jar.getInputStream(tomlEntry)) {
-                    String content = new String(
-                        is.readAllBytes(), StandardCharsets.UTF_8);
+                    String content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
                     modId = extractModId(content, modId);
                     deps  = extractDependencies(content);
                 }
@@ -143,71 +175,71 @@ public class ConflictDetector {
             return new ModInfo(displayName, modId, baseName.toLowerCase(), jarPath, deps);
 
         } catch (Exception e) {
+            // Return minimal info so the jar is still counted in the report
             return new ModInfo(baseName, baseName.toLowerCase(),
                 baseName.toLowerCase(), jarPath, List.of());
         }
     }
 
-    // ── TOML parsers (lightweight, no external library) ───────────────────────
+    // ── TOML parsers ──────────────────────────────────────────────────────────
 
-    // Extracts modId from mods.toml content
+    /** Extracts {@code modId} from {@code mods.toml} content. */
     private static String extractModId(String toml, String fallback) {
-        Pattern p = Pattern.compile("modId\\s*=\\s*\"([^\"]+)\"");
-        Matcher m = p.matcher(toml);
-        if (m.find()) return m.group(1);
-        return fallback;
+        Matcher m = Pattern.compile("modId\\s*=\\s*\"([^\"]+)\"").matcher(toml);
+        return m.find() ? m.group(1) : fallback;
     }
 
-    // Extracts [[dependencies.*]] blocks from mods.toml
-  private static List<ModDependency> extractDependencies(String toml) {
-    List<ModDependency> result = new ArrayList<>();
+    /**
+     * Extracts mandatory {@code [[dependencies.*]]} blocks from {@code mods.toml}.
+     *
+     * <p>Only includes dependencies where {@code mandatory = true} is explicitly set,
+     * or where the dependency is on {@code neoforge} or {@code minecraft} (which are
+     * always mandatory even without the field). All other deps without the field are
+     * treated as optional compatibility entries to reduce false positives.</p>
+     */
+    private static List<ModDependency> extractDependencies(String toml) {
+        List<ModDependency> result = new ArrayList<>();
 
-    Pattern sectionPattern = Pattern.compile(
-        "\\[\\[dependencies\\.[^]]+]]([^\\[]*)", Pattern.DOTALL);
-    Matcher sectionMatcher = sectionPattern.matcher(toml);
+        Matcher sectionMatcher = Pattern.compile(
+            "\\[\\[dependencies\\.[^]]+]]([^\\[]*)", Pattern.DOTALL
+        ).matcher(toml);
 
-    while (sectionMatcher.find()) {
-        String block = sectionMatcher.group(1);
+        while (sectionMatcher.find()) {
+            String block = sectionMatcher.group(1);
 
-        Matcher modIdM = Pattern.compile("modId\\s*=\\s*\"([^\"]+)\"").matcher(block);
-        if (!modIdM.find()) continue;
-        String depModId = modIdM.group(1);
+            Matcher modIdM = Pattern.compile("modId\\s*=\\s*\"([^\"]+)\"").matcher(block);
+            if (!modIdM.find()) continue;
+            String depModId = modIdM.group(1);
 
-        Matcher verM = Pattern.compile("versionRange\\s*=\\s*\"([^\"]+)\"").matcher(block);
-        String versionRange = verM.find() ? verM.group(1) : "*";
+            Matcher verM = Pattern.compile("versionRange\\s*=\\s*\"([^\"]+)\"").matcher(block);
+            String versionRange = verM.find() ? verM.group(1) : "*";
 
-        // Only include EXPLICITLY mandatory=true or dependencies without mandatory field
-        // that are NOT common optional-compat patterns
-        Matcher mandM = Pattern.compile("mandatory\\s*=\\s*(true|false)").matcher(block);
-        boolean mandatory;
-        if (mandM.find()) {
-            mandatory = mandM.group(1).equals("true");
-        } else {
-            // No mandatory field - treat as mandatory only if it's neoforge/minecraft
-            // Other deps without mandatory are likely optional compat
-            mandatory = depModId.equals("neoforge") || depModId.equals("minecraft");
+            Matcher mandM = Pattern.compile("mandatory\\s*=\\s*(true|false)").matcher(block);
+            boolean mandatory;
+            if (mandM.find()) {
+                mandatory = "true".equals(mandM.group(1));
+            } else {
+                // No field: assume mandatory only for core deps to reduce false positives
+                mandatory = depModId.equals("neoforge") || depModId.equals("minecraft");
+            }
+
+            if (mandatory) {
+                result.add(new ModDependency(depModId, versionRange));
+            }
         }
-
-        if (mandatory) {
-            result.add(new ModDependency(depModId, versionRange));
-        }
+        return result;
     }
-    return result;
-}
+
     // ── Checkers ──────────────────────────────────────────────────────────────
 
-    // Checks each mod's declared dependencies against loaded mods and NeoForge version
     private static void checkModDependencies(
             List<ModInfo> mods, String currentNeoForge, List<Issue> issues) {
-
         Set<String> loadedModIds = new HashSet<>();
         for (ModInfo m : mods) loadedModIds.add(m.modId());
 
         for (ModInfo mod : mods) {
             for (ModDependency dep : mod.dependencies()) {
-
                 if (dep.modId().equals("neoforge")) {
-                    // Check NeoForge version range
                     if (!versionInRange(currentNeoForge, dep.versionRange())) {
                         issues.add(new Issue(Severity.ERROR,
                             String.format("Mod '%s' requires NeoForge %s, current is %s",
@@ -219,7 +251,6 @@ public class ConflictDetector {
                         && !dep.modId().equals("forge")
                         && !dep.modId().equals("fabricloader")
                         && !loadedModIds.contains(dep.modId())) {
-                    // Missing required mod
                     issues.add(new Issue(Severity.WARNING,
                         String.format("Mod '%s' requires missing mod '%s'",
                             mod.displayName(), dep.modId()),
@@ -230,7 +261,6 @@ public class ConflictDetector {
         }
     }
 
-    // Checks for client-only mods by jar name pattern
     private static void checkClientOnlyMods(List<ModInfo> mods, List<Issue> issues) {
         for (ModInfo mod : mods) {
             for (String pattern : CLIENT_ONLY_MODS) {
@@ -240,12 +270,12 @@ public class ConflictDetector {
                             + " — not needed on server",
                         mod.path().getFileName().toString()
                     ));
+                    break; // One warning per jar is enough
                 }
             }
         }
     }
 
-    // Checks for jars in mods/ that are actually Bukkit plugins by name
     private static void checkPluginsInModsFolder(List<ModInfo> mods, List<Issue> issues) {
         for (ModInfo mod : mods) {
             for (String pattern : PLUGIN_NAMES_IN_MODS) {
@@ -255,15 +285,20 @@ public class ConflictDetector {
                             + " — move it to plugins/",
                         mod.path().getFileName().toString()
                     ));
+                    break;
                 }
             }
         }
     }
 
-    // Checks for jars in plugins/ that look like NeoForge mods
     private static void checkModsInPluginsFolder(List<ModInfo> plugins, List<Issue> issues) {
         for (ModInfo plugin : plugins) {
             String name = plugin.nameLower();
+
+            boolean isKnownPlugin = KNOWN_MULTI_PLATFORM_PLUGINS.stream()
+                .anyMatch(name::contains);
+            if (isKnownPlugin) continue;
+
             if (name.contains("neoforge") || name.contains("-forge-")
                     || name.contains("fabric")) {
                 issues.add(new Issue(Severity.WARNING,
@@ -275,14 +310,14 @@ public class ConflictDetector {
         }
     }
 
-    // Checks for jars with similar names in both mods/ and plugins/
     private static void checkDuplicates(
             List<ModInfo> mods, List<ModInfo> plugins, List<Issue> issues) {
         for (ModInfo mod : mods) {
+            String mk = mod.nameLower().replaceAll("[^a-z0-9]", "");
+            if (mk.length() < 5) continue;
             for (ModInfo plugin : plugins) {
-                String mk = mod.nameLower().replaceAll("[^a-z0-9]", "");
                 String pk = plugin.nameLower().replaceAll("[^a-z0-9]", "");
-                if (mk.length() < 5 || pk.length() < 5) continue;
+                if (pk.length() < 5) continue;
                 int len = Math.min(6, Math.min(mk.length(), pk.length()));
                 if (mk.substring(0, len).equals(pk.substring(0, len))) {
                     issues.add(new Issue(Severity.WARNING,
@@ -295,10 +330,16 @@ public class ConflictDetector {
         }
     }
 
-    // ── Version range checker ─────────────────────────────────────────────────
+    // ── Version comparison ────────────────────────────────────────────────────
 
-    // Checks if a version string satisfies a Maven version range.
-    // Supports: [x,), [x,y), *, any
+    /**
+     * Checks whether the given version satisfies the Maven version range.
+     * Supports: {@code [x,)}, {@code [x,y)}, {@code *}, {@code any}.
+     *
+     * @param version the version to check
+     * @param range   the Maven version range expression
+     * @return {@code true} if the version is within the range
+     */
     private static boolean versionInRange(String version, String range) {
         if (range == null || range.isBlank() || range.equals("*")
                 || range.equalsIgnoreCase("any")) {
@@ -307,14 +348,16 @@ public class ConflictDetector {
         try {
             Matcher minMatcher = VERSION_RANGE_MIN.matcher(range);
             if (minMatcher.find()) {
-                String minVer = minMatcher.group(1);
-                return compareVersions(version, minVer) >= 0;
+                return compareVersions(version, minMatcher.group(1)) >= 0;
             }
         } catch (Exception ignored) {}
-        return true; // If we cannot parse range, assume ok
+        return true;
     }
 
-    // Simple numeric version comparison: "21.1.228" vs "21.1.234"
+    /**
+     * Compares two dot/dash-separated version strings numerically.
+     * Non-numeric segments are treated as 0.
+     */
     private static int compareVersions(String a, String b) {
         String[] partsA = a.split("[.\\-]");
         String[] partsB = b.split("[.\\-]");
@@ -328,15 +371,17 @@ public class ConflictDetector {
     }
 
     private static int parseIntSafe(String s) {
-        try { return Integer.parseInt(s); }
-        catch (NumberFormatException e) { return 0; }
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
-    // ── Output ────────────────────────────────────────────────────────────────
+    // ── Report output ─────────────────────────────────────────────────────────
 
     private static void printResults(
             List<ModInfo> mods, List<ModInfo> plugins, List<Issue> issues) {
-
         long errors   = issues.stream().filter(i -> i.severity() == Severity.ERROR).count();
         long warnings = issues.stream().filter(i -> i.severity() == Severity.WARNING).count();
 
@@ -348,7 +393,7 @@ public class ConflictDetector {
         LOGGER.info("+-----------------------------------------------+");
 
         if (issues.isEmpty()) {
-            LOGGER.info("|  OK: No conflicts detected. All good!         |");
+            LOGGER.info("|  OK: No conflicts detected.                   |");
         } else {
             for (Issue issue : issues) {
                 if (issue.severity() == Severity.ERROR) {
@@ -366,20 +411,22 @@ public class ConflictDetector {
         LOGGER.info("+-----------------------------------------------+");
 
         if (errors > 0) {
-            LOGGER.error("[Arclight-J2K] {} critical issue(s) found! Server may not start correctly.", errors);
+            LOGGER.error("[Arclight-J2K] {} critical issue(s) detected! Server may malfunction.", errors);
         }
         if (warnings > 0) {
-            LOGGER.warn("[Arclight-J2K] {} warning(s) found. Check compatibility.", warnings);
+            LOGGER.warn("[Arclight-J2K] {} warning(s) found. Review compatibility.", warnings);
         }
         if (errors == 0 && warnings == 0) {
-            LOGGER.info("[Arclight-J2K] All checks passed.");
+            LOGGER.info("[Arclight-J2K] All compatibility checks passed.");
         }
     }
 
     // ── Records ───────────────────────────────────────────────────────────────
 
+    /** A declared mandatory dependency of a mod. */
     public record ModDependency(String modId, String versionRange) {}
 
+    /** Metadata extracted from a jar in {@code mods/} or {@code plugins/}. */
     public record ModInfo(
         String displayName,
         String modId,
@@ -388,12 +435,10 @@ public class ConflictDetector {
         List<ModDependency> dependencies
     ) {}
 
-    public record Issue(
-        Severity severity,
-        String description,
-        String file
-    ) {}
+    /** A detected compatibility issue. */
+    public record Issue(Severity severity, String description, String file) {}
 
+    /** The complete result of a compatibility scan. */
     public record ScanResult(
         List<ModInfo> mods,
         List<ModInfo> plugins,
@@ -410,5 +455,6 @@ public class ConflictDetector {
         }
     }
 
+    /** Severity levels for compatibility issues. */
     public enum Severity { ERROR, WARNING, INFO }
 }

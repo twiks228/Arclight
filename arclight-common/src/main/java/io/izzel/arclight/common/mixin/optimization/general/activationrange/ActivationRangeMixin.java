@@ -11,7 +11,7 @@ public class ActivationRangeMixin {
 
     /**
      * @author IzzelAliz
-     * @reason entityLists
+     * @reason Delegate activation logic to bridge for better mod compatibility
      */
     @Overwrite
     private static void activateEntity(Entity entity) {

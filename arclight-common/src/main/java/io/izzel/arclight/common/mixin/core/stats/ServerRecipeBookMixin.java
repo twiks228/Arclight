@@ -1,6 +1,5 @@
 package io.izzel.arclight.common.mixin.core.stats;
 
-import com.google.common.collect.Lists;
 import net.minecraft.advancements.CriteriaTriggers;
 import net.minecraft.network.protocol.game.ClientboundRecipePacket;
 import net.minecraft.resources.ResourceLocation;
@@ -16,45 +15,80 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
-@Mixin(ServerRecipeBook.class)
+/**
+ * Mixin for {@link ServerRecipeBook} that integrates Bukkit recipe unlock events
+ * and guards packet sending when the player connection is no longer available.
+ */
+@Mixin(value = ServerRecipeBook.class, priority = 1100)
 public abstract class ServerRecipeBookMixin extends RecipeBook {
 
     // @formatter:off
-    @Shadow protected abstract void sendRecipes(ClientboundRecipePacket.State p_12802_, ServerPlayer p_12803_, List<ResourceLocation> p_12804_);
+    @Shadow protected abstract void sendRecipes(ClientboundRecipePacket.State state, ServerPlayer player, List<ResourceLocation> recipes);
     // @formatter:on
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Overwritten to fire Bukkit recipe unlock hooks before recipes are
+     * added to the player's recipe book, allowing plugins to cancel unlocks.
      */
     @Overwrite
-    public int addRecipes(Collection<RecipeHolder<?>> p_12792_, ServerPlayer p_12793_) {
-        List<ResourceLocation> list = Lists.newArrayList();
-        int i = 0;
+    public int addRecipes(Collection<RecipeHolder<?>> recipes, ServerPlayer player) {
+        List<ResourceLocation> unlockedRecipes = new ArrayList<>();
+        int addedCount = 0;
 
-        for (RecipeHolder<?> recipeholder : p_12792_) {
-            ResourceLocation resourcelocation = recipeholder.id();
-            if (!this.known.contains(resourcelocation) && !recipeholder.value().isSpecial() && CraftEventFactory.handlePlayerRecipeListUpdateEvent(p_12793_, resourcelocation)) {
-                this.add(resourcelocation);
-                this.addHighlight(resourcelocation);
-                list.add(resourcelocation);
-                CriteriaTriggers.RECIPE_UNLOCKED.trigger(p_12793_, recipeholder);
-                ++i;
+        for (RecipeHolder<?> recipeHolder : recipes) {
+            ResourceLocation recipeId = recipeHolder.id();
+
+            if (this.known.contains(recipeId)) {
+                continue;
             }
+
+            if (recipeHolder.value().isSpecial()) {
+                continue;
+            }
+
+            if (!CraftEventFactory.handlePlayerRecipeListUpdateEvent(player, recipeId)) {
+                continue;
+            }
+
+            this.add(recipeId);
+            this.addHighlight(recipeId);
+            unlockedRecipes.add(recipeId);
+            CriteriaTriggers.RECIPE_UNLOCKED.trigger(player, recipeHolder);
+            ++addedCount;
         }
 
-        if (list.size() > 0) {
-            this.sendRecipes(ClientboundRecipePacket.State.ADD, p_12793_, list);
+        if (!unlockedRecipes.isEmpty()) {
+            this.sendRecipes(ClientboundRecipePacket.State.ADD, player, unlockedRecipes);
         }
 
-        return i;
+        return addedCount;
     }
 
-    @Inject(method = "sendRecipes", cancellable = true, at = @At("HEAD"))
-    public void arclight$returnIfFail(ClientboundRecipePacket.State state, ServerPlayer player, List<ResourceLocation> recipesIn, CallbackInfo ci) {
+    /**
+     * Prevents recipe packets from being sent to players whose network connection
+     * is already gone (e.g. during disconnect race conditions).
+     *
+     * @param state     the packet state
+     * @param player    the target player
+     * @param recipesIn the recipes to send
+     * @param ci        callback info
+     */
+    @Inject(
+        method = "sendRecipes",
+        cancellable = true,
+        at = @At("HEAD")
+    )
+    public void arclight$returnIfFail(
+            ClientboundRecipePacket.State state,
+            ServerPlayer player,
+            List<ResourceLocation> recipesIn,
+            CallbackInfo ci
+    ) {
         if (player.connection == null) {
             ci.cancel();
         }

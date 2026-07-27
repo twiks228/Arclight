@@ -46,6 +46,7 @@ import org.objectweb.asm.Opcodes;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Slice;
@@ -54,7 +55,20 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.List;
 
-@Mixin(ServerPlayerGameMode.class)
+/**
+ * Mixin for {@link ServerPlayerGameMode} that integrates Bukkit block interaction,
+ * breaking, and game mode change events into the player game mode pipeline.
+ *
+ * <p>Key responsibilities:</p>
+ * <ul>
+ *   <li>Fires {@link PlayerGameModeChangeEvent} on game mode changes</li>
+ *   <li>Fires {@link PlayerInteractEvent} for left/right click block interactions</li>
+ *   <li>Fires {@link BlockDamageEvent} when a player starts breaking a block</li>
+ *   <li>Fires {@link BlockBreakEvent} and handles item drops via captures</li>
+ *   <li>Tracks the last interact position/hand/item for anti-event-spam logic</li>
+ * </ul>
+ */
+@Mixin(value = ServerPlayerGameMode.class, priority = 1100)
 public abstract class ServerPlayerGameModeMixin implements ServerPlayerGameModeBridge {
 
     // @formatter:off
@@ -63,48 +77,129 @@ public abstract class ServerPlayerGameModeMixin implements ServerPlayerGameModeB
     @Shadow private GameType gameModeForPlayer;
     // @formatter:on
 
-    public boolean interactResult = false;
-    public boolean firedInteract = false;
-    public BlockPos interactPosition;
-    public InteractionHand interactHand;
-    public ItemStack interactItemStack;
+    // ── Interact state tracking ───────────────────────────────────────────────
 
-    @Inject(method = "changeGameModeForPlayer", cancellable = true, at = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerPlayerGameMode;setGameModeForPlayer(Lnet/minecraft/world/level/GameType;Lnet/minecraft/world/level/GameType;)V"))
-    private void arclight$gameModeEvent(GameType gameType, CallbackInfoReturnable<Boolean> cir) {
-        PlayerGameModeChangeEvent event = new PlayerGameModeChangeEvent(((ServerPlayerBridge) player).bridge$getBukkitEntity(), GameMode.getByValue(gameType.getId()));
+    /**
+     * Whether the last interact event used the item in hand.
+     * Used to suppress the default item interaction when cancelled by a plugin.
+     */
+    @Unique public boolean arclight$interactResult = false;
+
+    /** Whether the interact event has already been fired for this interaction. */
+    @Unique public boolean arclight$firedInteract = false;
+
+    /** The block position of the last right-click-block interaction. */
+    @Unique public BlockPos arclight$interactPosition;
+
+    /** The hand used in the last interaction. */
+    @Unique public InteractionHand arclight$interactHand;
+
+    /** A copy of the item stack in hand at the time of the last interaction. */
+    @Unique public ItemStack arclight$interactItemStack;
+
+    // ── Game mode change event ────────────────────────────────────────────────
+
+    /**
+     * Fires {@link PlayerGameModeChangeEvent} before the game mode is actually changed.
+     * Cancels the change if the event is cancelled.
+     */
+    @Inject(
+        method = "changeGameModeForPlayer",
+        cancellable = true,
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/level/ServerPlayerGameMode;setGameModeForPlayer(" +
+                     "Lnet/minecraft/world/level/GameType;Lnet/minecraft/world/level/GameType;)V"
+        )
+    )
+    private void arclight$gameModeEvent(GameType newGameType, CallbackInfoReturnable<Boolean> cir) {
+        PlayerGameModeChangeEvent event = new PlayerGameModeChangeEvent(
+            ((ServerPlayerBridge) player).bridge$getBukkitEntity(),
+            GameMode.getByValue(newGameType.getId())
+        );
         Bukkit.getPluginManager().callEvent(event);
         if (event.isCancelled()) {
             cir.setReturnValue(false);
         }
     }
 
-    /*
-     * This series of events are controlled by respective mod loaders.
-     * It is thus implemented differently when the original event gets cancelled.
-     * See PSI for firing when it's cancelled.
+    // ── Block break interactions ──────────────────────────────────────────────
+
+    /**
+     * Fires a PlayerInteractEvent when the player cannot interact with a block
+     * due to {@code mayInteract} returning false.
+     *
+     * <p>Also sends a block update to the client and refreshes the block entity
+     * data so the client doesn't show a broken state for a block it can't break.</p>
+     *
+     * <p><b>Note:</b> This series of interact events is controlled by the mod loader.
+     * The cancellation behaviour differs from standard Bukkit events —
+     * see {@link io.izzel.arclight.common.mixin.core.server.network.ServerGamePacketListenerImpl_HandlerMixin}
+     * for the PSI-side cancel handling.</p>
      */
-    @Decorate(method = "handleBlockBreakAction", at = @At(value = "INVOKE", ordinal = 0, target = "Lnet/minecraft/server/network/ServerGamePacketListenerImpl;send(Lnet/minecraft/network/protocol/Packet;)V"),
-        slice = @Slice(from = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerLevel;mayInteract(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/core/BlockPos;)Z")))
-    private void arclight$mayNotInteractEvent(ServerGamePacketListenerImpl instance, Packet<?> packet, BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction) throws Throwable {
-        CraftEventFactory.callPlayerInteractEvent(this.player, Action.LEFT_CLICK_BLOCK, blockPos, direction, this.player.getInventory().getSelected(), InteractionHand.MAIN_HAND);
-        DecorationOps.callsite().invoke(instance, packet);
-        BlockEntity blockEntity = this.level.getBlockEntity(blockPos);
-        if (blockEntity != null) {
-            // FIXME: Oops, this might be null!
-            this.player.connection.send(blockEntity.getUpdatePacket());
+    @Decorate(
+        method = "handleBlockBreakAction",
+        at = @At(
+            value = "INVOKE",
+            ordinal = 0,
+            target = "Lnet/minecraft/server/network/ServerGamePacketListenerImpl;send(Lnet/minecraft/network/protocol/Packet;)V"
+        ),
+        slice = @Slice(
+            from = @At(
+                value = "INVOKE",
+                target = "Lnet/minecraft/server/level/ServerLevel;mayInteract(" +
+                         "Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/core/BlockPos;)Z"
+            )
+        )
+    )
+    private void arclight$mayNotInteractEvent(
+            ServerGamePacketListenerImpl listener,
+            Packet<?> packet,
+            BlockPos blockPos,
+            ServerboundPlayerActionPacket.Action action,
+            Direction direction
+    ) throws Throwable {
+        CraftEventFactory.callPlayerInteractEvent(
+            this.player, Action.LEFT_CLICK_BLOCK, blockPos, direction,
+            this.player.getInventory().getSelected(), InteractionHand.MAIN_HAND
+        );
+        DecorationOps.callsite().invoke(listener, packet);
+        // Also refresh block entity data if present
+        BlockEntity be = this.level.getBlockEntity(blockPos);
+        if (be != null) {
+            this.player.connection.send(be.getUpdatePacket());
         }
     }
 
-    @Decorate(method = "handleBlockBreakAction", inject = true, at = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerPlayerGameMode;isCreative()Z"))
-    private void arclight$interactEvent(BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction,
-                                        @Local(allocate = "playerInteractEvent") PlayerInteractEvent event) throws Throwable {
-        event = CraftEventFactory.callPlayerInteractEvent(this.player, Action.LEFT_CLICK_BLOCK, blockPos, direction, this.player.getInventory().getSelected(), InteractionHand.MAIN_HAND);
+    /**
+     * Fires the main PlayerInteractEvent for left-click-block before the block
+     * break process begins. Cancels the break if the event is cancelled.
+     */
+    @Decorate(
+        method = "handleBlockBreakAction",
+        inject = true,
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/level/ServerPlayerGameMode;isCreative()Z"
+        )
+    )
+    private void arclight$interactEvent(
+            BlockPos blockPos,
+            ServerboundPlayerActionPacket.Action action,
+            Direction direction,
+            @Local(allocate = "playerInteractEvent") PlayerInteractEvent event
+    ) throws Throwable {
+        event = CraftEventFactory.callPlayerInteractEvent(
+            this.player, Action.LEFT_CLICK_BLOCK, blockPos, direction,
+            this.player.getInventory().getSelected(), InteractionHand.MAIN_HAND
+        );
+
         if (event.isCancelled()) {
+            // Restore the block visually for the client
             this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, blockPos));
-            BlockEntity blockEntity = this.level.getBlockEntity(blockPos);
-            if (blockEntity != null) {
-                // FIXME: Oops, this might be null!
-                this.player.connection.send(blockEntity.getUpdatePacket());
+            BlockEntity be = this.level.getBlockEntity(blockPos);
+            if (be != null) {
+                this.player.connection.send(be.getUpdatePacket());
             }
             DecorationOps.cancel().invoke();
             return;
@@ -112,154 +207,282 @@ public abstract class ServerPlayerGameModeMixin implements ServerPlayerGameModeB
         DecorationOps.blackhole().invoke();
     }
 
-    @Decorate(method = "handleBlockBreakAction", at = @At(value = "INVOKE", ordinal = 0, target = "Lnet/minecraft/world/level/block/state/BlockState;isAir()Z"))
-    private boolean arclight$playerInteractCancelled(BlockState instance, BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction,
-                                                     @Local(allocate = "playerInteractEvent") PlayerInteractEvent event) throws Throwable {
-        boolean result = false;
-        if (event.useInteractedBlock() == org.bukkit.event.Event.Result.DENY) {
-            BlockState data = this.level.getBlockState(blockPos);
-            if (data.getBlock() instanceof DoorBlock) {
-                boolean bottom = data.getValue(DoorBlock.HALF) == DoubleBlockHalf.LOWER;
+    /**
+     * Handles the case where the interact event denied block interaction
+     * (e.g., right-click on a door that the plugin wants to keep closed).
+     * Sends corrective block updates for double-height blocks.
+     */
+    @Decorate(
+        method = "handleBlockBreakAction",
+        at = @At(
+            value = "INVOKE",
+            ordinal = 0,
+            target = "Lnet/minecraft/world/level/block/state/BlockState;isAir()Z"
+        )
+    )
+    private boolean arclight$playerInteractCancelled(
+            BlockState blockState,
+            BlockPos blockPos,
+            ServerboundPlayerActionPacket.Action action,
+            Direction direction,
+            @Local(allocate = "playerInteractEvent") PlayerInteractEvent event
+    ) throws Throwable {
+        if (event.useInteractedBlock() == Event.Result.DENY) {
+            BlockState currentState = this.level.getBlockState(blockPos);
+            if (currentState.getBlock() instanceof DoorBlock) {
+                boolean isBottom = currentState.getValue(DoorBlock.HALF) == DoubleBlockHalf.LOWER;
                 this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, blockPos));
-                this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, bottom ? blockPos.above() : blockPos.below()));
-            } else if (data.getBlock() instanceof TrapDoorBlock) {
+                this.player.connection.send(new ClientboundBlockUpdatePacket(
+                    this.level, isBottom ? blockPos.above() : blockPos.below()
+                ));
+            } else if (currentState.getBlock() instanceof TrapDoorBlock) {
                 this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, blockPos));
             }
-            result = true;
-        } else {
-            result = (boolean) DecorationOps.callsite().invoke(instance);
+            return true; // Treat as air to cancel vanilla interaction
         }
-        return result;
+        return (boolean) DecorationOps.callsite().invoke(blockState);
     }
 
-    @Decorate(method = "handleBlockBreakAction", inject = true, at = @At(value = "INVOKE", ordinal = 1, target = "Lnet/minecraft/world/level/block/state/BlockState;isAir()Z"))
-    private void arclight$blockDamageEvent(BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction,
-                                           @Local(ordinal = -1) float f,
-                                           @Local(allocate = "playerInteractEvent") PlayerInteractEvent event) throws Throwable {
+    /**
+     * Fires {@link BlockDamageEvent} when the player starts breaking a block
+     * (i.e., the break progress is between 0 and 1 exclusive).
+     * Cancels the break or enables insta-break based on the event result.
+     */
+    @Decorate(
+        method = "handleBlockBreakAction",
+        inject = true,
+        at = @At(
+            value = "INVOKE",
+            ordinal = 1,
+            target = "Lnet/minecraft/world/level/block/state/BlockState;isAir()Z"
+        )
+    )
+    private void arclight$blockDamageEvent(
+            BlockPos blockPos,
+            ServerboundPlayerActionPacket.Action action,
+            Direction direction,
+            @Local(ordinal = -1) float breakProgress,
+            @Local(allocate = "playerInteractEvent") PlayerInteractEvent event
+    ) throws Throwable {
         if (event.useItemInHand() == Event.Result.DENY) {
-            if (f > 1.0f) {
+            if (breakProgress > 1.0F) {
                 this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, blockPos));
             }
             return;
         }
-        BlockDamageEvent blockEvent = CraftEventFactory.callBlockDamageEvent(this.player, blockPos, this.player.getInventory().getSelected(), f >= 1.0f);
-        if (blockEvent.isCancelled()) {
+
+        BlockDamageEvent damageEvent = CraftEventFactory.callBlockDamageEvent(
+            this.player, blockPos, this.player.getInventory().getSelected(),
+            breakProgress >= 1.0F
+        );
+
+        if (damageEvent.isCancelled()) {
             this.player.connection.send(new ClientboundBlockUpdatePacket(this.level, blockPos));
             return;
         }
-        if (blockEvent.getInstaBreak()) {
-            f = 2.0f;
+
+        if (damageEvent.getInstaBreak()) {
+            breakProgress = 2.0F;
         }
-        DecorationOps.blackhole().invoke(f);
+        DecorationOps.blackhole().invoke(breakProgress);
     }
 
-    @Inject(method = "handleBlockBreakAction", at = @At(value = "CONSTANT", args = "stringValue=aborted destroying"))
-    private void arclight$abortBlockBreak(BlockPos blockPos, ServerboundPlayerActionPacket.Action action, Direction direction, int i, int j, CallbackInfo ci) {
-        CraftEventFactory.callBlockDamageAbortEvent(this.player, blockPos, this.player.getInventory().getSelected());
+    /**
+     * Fires {@link org.bukkit.event.block.BlockDamageAbortEvent} when block breaking
+     * is aborted (e.g., player cancels mid-break).
+     */
+    @Inject(
+        method = "handleBlockBreakAction",
+        at = @At(
+            value = "CONSTANT",
+            args = "stringValue=aborted destroying"
+        )
+    )
+    private void arclight$abortBlockBreak(
+            BlockPos blockPos,
+            ServerboundPlayerActionPacket.Action action,
+            Direction direction,
+            int i, int j,
+            CallbackInfo ci
+    ) {
+        CraftEventFactory.callBlockDamageAbortEvent(
+            this.player, blockPos, this.player.getInventory().getSelected()
+        );
     }
 
-    @Inject(method = "destroyBlock", at = @At("RETURN"))
+    // ── Block break drop handling ─────────────────────────────────────────────
+
+    /**
+     * Processes block drop captures after a block is destroyed.
+     * Fires the BlockDropItemEvent with the collected drops.
+     */
+    @Inject(
+        method = "destroyBlock",
+        at = @At("RETURN")
+    )
     public void arclight$resetBlockBreak(BlockPos pos, CallbackInfoReturnable<Boolean> cir) {
-        ArclightCaptures.BlockBreakEventContext breakEventContext = ArclightCaptures.popPrimaryBlockBreakEvent();
-
-        if (breakEventContext != null) {
-            bridge$handleBlockDrop(breakEventContext, pos);
+        ArclightCaptures.BlockBreakEventContext ctx = ArclightCaptures.popPrimaryBlockBreakEvent();
+        if (ctx != null) {
+            bridge$handleBlockDrop(ctx, pos);
         }
     }
 
-    @Inject(method = {"tick", "destroyAndAck"}, at = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerPlayerGameMode;destroyBlock(Lnet/minecraft/core/BlockPos;)Z"))
+    /**
+     * Clears stale block break event captures before starting a new break session.
+     * Prevents leftover events from a previous interrupted break from being processed.
+     */
+    @Inject(
+        method = {"tick", "destroyAndAck"},
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/level/ServerPlayerGameMode;destroyBlock(Lnet/minecraft/core/BlockPos;)Z"
+        )
+    )
     public void arclight$clearCaptures(CallbackInfo ci) {
-        // clear the event stack in case that interrupted events are left here unhandled
-        // it should be a new event capture session each time destroyBlock is called from these two contexts
         ArclightCaptures.clearBlockBreakEventContexts();
     }
 
     @Override
-    public void bridge$handleBlockDrop(ArclightCaptures.BlockBreakEventContext breakEventContext, BlockPos pos) {
-        BlockBreakEvent breakEvent = breakEventContext.getEvent();
-        List<ItemEntity> blockDrops = breakEventContext.getBlockDrops();
-        org.bukkit.block.BlockState state = breakEventContext.getBlockBreakPlayerState();
+    public void bridge$handleBlockDrop(
+            ArclightCaptures.BlockBreakEventContext ctx, BlockPos pos) {
+        BlockBreakEvent breakEvent = ctx.getEvent();
+        List<ItemEntity> drops = ctx.getBlockDrops();
+        org.bukkit.block.BlockState state = ctx.getBlockBreakPlayerState();
 
-        if (blockDrops != null && (breakEvent == null || breakEvent.isDropItems())) {
+        if (drops != null && (breakEvent == null || breakEvent.isDropItems())) {
             CraftBlock craftBlock = CraftBlock.at(this.level, pos);
-            CraftEventFactory.handleBlockDropItemEvent(craftBlock, state, this.player, blockDrops);
+            CraftEventFactory.handleBlockDropItemEvent(craftBlock, state, this.player, drops);
         }
     }
 
+    // ── Interact state bridge ─────────────────────────────────────────────────
+
     @Override
     public boolean bridge$isFiredInteract() {
-        return firedInteract;
+        return arclight$firedInteract;
     }
 
     @Override
     public void bridge$setFiredInteract(boolean b) {
-        this.firedInteract = b;
+        this.arclight$firedInteract = b;
     }
 
     @Override
     public boolean bridge$getInteractResult() {
-        return interactResult;
+        return arclight$interactResult;
     }
 
     @Override
     public void bridge$setInteractResult(boolean b) {
-        this.interactResult = b;
+        this.arclight$interactResult = b;
     }
 
     @Override
     public BlockPos bridge$getInteractPosition() {
-        return interactPosition;
+        return arclight$interactPosition;
     }
 
     @Override
     public InteractionHand bridge$getInteractHand() {
-        return interactHand;
+        return arclight$interactHand;
     }
 
     @Override
     public ItemStack bridge$getInteractItemStack() {
-        return interactItemStack;
+        return arclight$interactItemStack;
     }
 
-    @Inject(method = "useItemOn", cancellable = true, at = @At(value = "FIELD", opcode = Opcodes.GETFIELD, ordinal = 0, target = "Lnet/minecraft/server/level/ServerPlayerGameMode;gameModeForPlayer:Lnet/minecraft/world/level/GameType;"))
-    private void arclight$rightClickBlock(ServerPlayer playerIn, Level worldIn, ItemStack stackIn, InteractionHand handIn, BlockHitResult blockRaytraceResultIn, CallbackInfoReturnable<InteractionResult> cir) {
-        BlockPos blockpos = blockRaytraceResultIn.getBlockPos();
-        BlockState blockstate = worldIn.getBlockState(blockpos);
+    // ── Right click block handling ────────────────────────────────────────────
+
+    /**
+     * Fires {@link PlayerInteractEvent} for right-click-block interactions.
+     * Handles UI and inventory sync for cancelled interactions on special blocks
+     * (doors, cakes, double-height blocks).
+     */
+    @Inject(
+        method = "useItemOn",
+        cancellable = true,
+        at = @At(
+            value = "FIELD",
+            opcode = Opcodes.GETFIELD,
+            ordinal = 0,
+            target = "Lnet/minecraft/server/level/ServerPlayerGameMode;gameModeForPlayer:Lnet/minecraft/world/level/GameType;"
+        )
+    )
+    private void arclight$rightClickBlock(
+            ServerPlayer player,
+            Level world,
+            ItemStack stack,
+            InteractionHand hand,
+            BlockHitResult hitResult,
+            CallbackInfoReturnable<InteractionResult> cir
+    ) {
+        BlockPos pos = hitResult.getBlockPos();
+        BlockState blockState = world.getBlockState(pos);
         boolean cancelledBlock = false;
+
+        // Spectators can only open inventories via MenuProvider blocks
         if (this.gameModeForPlayer == GameType.SPECTATOR) {
-            MenuProvider provider = blockstate.getMenuProvider(worldIn, blockpos);
+            MenuProvider provider = blockState.getMenuProvider(world, pos);
             cancelledBlock = !(provider instanceof MenuProvider);
         }
-        if (playerIn.getCooldowns().isOnCooldown(stackIn.getItem())) {
+
+        // Items on cooldown cannot be used
+        if (player.getCooldowns().isOnCooldown(stack.getItem())) {
             cancelledBlock = true;
         }
-        PlayerInteractEvent bukkitEvent = CraftEventFactory.callPlayerInteractEvent(playerIn, Action.RIGHT_CLICK_BLOCK, blockpos, blockRaytraceResultIn.getDirection(), stackIn, cancelledBlock, handIn, blockRaytraceResultIn.getLocation());
+
+        PlayerInteractEvent event = CraftEventFactory.callPlayerInteractEvent(
+            player, Action.RIGHT_CLICK_BLOCK, pos, hitResult.getDirection(),
+            stack, cancelledBlock, hand, hitResult.getLocation()
+        );
+
         bridge$setFiredInteract(true);
-        bridge$setInteractResult(bukkitEvent.useItemInHand() == Event.Result.DENY);
-        interactPosition = blockpos.immutable();
-        interactHand = handIn;
-        interactItemStack = stackIn.copy();
-        if (bukkitEvent.useInteractedBlock() == Event.Result.DENY) {
-            if (blockstate.getBlock() instanceof DoorBlock) {
-                boolean bottom = blockstate.getValue(DoorBlock.HALF) == DoubleBlockHalf.LOWER;
-                playerIn.connection.send(new ClientboundBlockUpdatePacket(this.level, bottom ? blockpos.above() : blockpos.below()));
-            } else if (blockstate.getBlock() instanceof CakeBlock) {
-                ((ServerPlayerBridge) playerIn).bridge$getBukkitEntity().sendHealthUpdate();
-            } else if (stackIn.getItem() instanceof DoubleHighBlockItem) {
-                // send a correcting update to the client, as it already placed the upper half of the bisected item
-                playerIn.connection.send(new ClientboundBlockUpdatePacket(level, blockpos.relative(blockRaytraceResultIn.getDirection()).above()));
-                // send a correcting update to the client for the block above as well, this because of replaceable blocks (such as grass, sea grass etc)
-                playerIn.connection.send(new ClientboundBlockUpdatePacket(level, blockpos.above()));
+        bridge$setInteractResult(event.useItemInHand() == Event.Result.DENY);
+        arclight$interactPosition = pos.immutable();
+        arclight$interactHand = hand;
+        arclight$interactItemStack = stack.copy();
+
+        if (event.useInteractedBlock() == Event.Result.DENY) {
+            // Send corrective block updates for special double-height/interactive blocks
+            if (blockState.getBlock() instanceof DoorBlock) {
+                boolean isBottom = blockState.getValue(DoorBlock.HALF) == DoubleBlockHalf.LOWER;
+                player.connection.send(new ClientboundBlockUpdatePacket(
+                    this.level, isBottom ? pos.above() : pos.below()
+                ));
+            } else if (blockState.getBlock() instanceof CakeBlock) {
+                // Eating from a cake changes health — sync it back
+                ((ServerPlayerBridge) player).bridge$getBukkitEntity().sendHealthUpdate();
+            } else if (stack.getItem() instanceof DoubleHighBlockItem) {
+                // Fix visual artifact for double-height block placement
+                player.connection.send(new ClientboundBlockUpdatePacket(
+                    this.level, pos.relative(hitResult.getDirection()).above()
+                ));
+                player.connection.send(new ClientboundBlockUpdatePacket(this.level, pos.above()));
             }
-            ((ServerPlayerBridge) playerIn).bridge$getBukkitEntity().updateInventory();
-            cir.setReturnValue((bukkitEvent.useItemInHand() != Event.Result.ALLOW) ? InteractionResult.SUCCESS : InteractionResult.PASS);
+            ((ServerPlayerBridge) player).bridge$getBukkitEntity().updateInventory();
+            cir.setReturnValue(
+                (event.useItemInHand() != Event.Result.ALLOW)
+                    ? InteractionResult.SUCCESS
+                    : InteractionResult.PASS
+            );
         }
     }
 
-    @Decorate(method = "useItemOn", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/item/ItemCooldowns;isOnCooldown(Lnet/minecraft/world/item/Item;)Z"))
-    private boolean arclight$useInteractResult(ItemCooldowns instance, Item item) throws Throwable {
-        var result = (boolean) DecorationOps.callsite().invoke(instance, item);
+    /**
+     * Replaces the item cooldown check result with the Arclight interact result
+     * (from the previously fired interact event) to ensure consistent cancellation.
+     */
+    @Decorate(
+        method = "useItemOn",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/world/item/ItemCooldowns;isOnCooldown(Lnet/minecraft/world/item/Item;)Z"
+        )
+    )
+    private boolean arclight$useInteractResult(ItemCooldowns cooldowns, Item item) throws Throwable {
+        var result = (boolean) DecorationOps.callsite().invoke(cooldowns, item);
         DecorationOps.blackhole().invoke(result);
-        return interactResult;
+        return arclight$interactResult;
     }
 }

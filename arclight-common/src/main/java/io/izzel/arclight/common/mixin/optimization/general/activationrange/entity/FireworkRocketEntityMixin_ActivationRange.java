@@ -6,7 +6,12 @@ import org.bukkit.craftbukkit.v.event.CraftEventFactory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
-@Mixin(FireworkRocketEntity.class)
+/**
+ * Mixin for FireworkRocketEntity within the ActivationRange system.
+ * Ensures the firework's lifetime countdown and explosion trigger
+ * still function correctly while the entity is inactive.
+ */
+@Mixin(value = FireworkRocketEntity.class, priority = 1100)
 public abstract class FireworkRocketEntityMixin_ActivationRange extends EntityMixin_ActivationRange {
 
     // @formatter:off
@@ -18,9 +23,16 @@ public abstract class FireworkRocketEntityMixin_ActivationRange extends EntityMi
     @Override
     public void inactiveTick() {
         super.inactiveTick();
+
         ++this.life;
-        if (!this.level().isClientSide && this.life > this.lifetime) {
-            if (!CraftEventFactory.callFireworkExplodeEvent((FireworkRocketEntity)(Object) this).isCancelled()) {
+
+        // Explosion logic should only be authoritative on the server side
+        if (this.level().isClientSide) return;
+
+        if (this.life > this.lifetime) {
+            // Fire the Bukkit event before triggering the actual explosion
+            if (!CraftEventFactory.callFireworkExplodeEvent(
+                    (FireworkRocketEntity) (Object) this).isCancelled()) {
                 this.explode();
             }
         }

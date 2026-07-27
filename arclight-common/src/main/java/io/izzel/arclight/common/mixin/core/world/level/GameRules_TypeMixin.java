@@ -8,15 +8,28 @@ import org.spongepowered.asm.mixin.Unique;
 
 import java.util.function.BiConsumer;
 
-@Mixin(GameRules.Type.class)
+/**
+ * Mixin for {@link GameRules.Type} that stores a per-world callback
+ * registered by {@link GameRulesMixin#arclight$initPerWorldCallback}.
+ *
+ * <p>The callback is invoked when the game rule value changes through
+ * a command in a specific world, replacing the global server-level callback.</p>
+ *
+ * @param <T> the game rule value type
+ */
+@Mixin(value = GameRules.Type.class, priority = 1100)
 public class GameRules_TypeMixin<T extends GameRules.Value<T>> implements GameRules_TypeBridge<T> {
 
+    /**
+     * The per-world callback to invoke when this rule's value changes.
+     * {@code null} if no per-world callback has been registered.
+     */
     @Unique
     private BiConsumer<ServerLevel, T> arclight$perWorldCallback;
 
     @Override
     public void arclight$setPerWorldCallback(BiConsumer<ServerLevel, T> callback) {
-        arclight$perWorldCallback = callback;
+        this.arclight$perWorldCallback = callback;
     }
 
     @Override

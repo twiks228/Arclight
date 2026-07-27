@@ -5,7 +5,12 @@ import net.minecraft.world.entity.projectile.AbstractArrow;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
-@Mixin(AbstractArrow.class)
+/**
+ * Mixin for AbstractArrow within the ActivationRange system.
+ * Ensures the "time stuck in ground" counter keeps advancing
+ * for inactive projectiles, which is required for arrow despawn logic.
+ */
+@Mixin(value = AbstractArrow.class, priority = 1100)
 public abstract class AbstractArrowMixin_ActivationRange extends EntityMixin_ActivationRange {
 
     // @formatter:off
@@ -16,8 +21,14 @@ public abstract class AbstractArrowMixin_ActivationRange extends EntityMixin_Act
     @Override
     public void inactiveTick() {
         super.inactiveTick();
+
+        // Only increment while the arrow is actually stuck in a block
+        // inGroundTime is used to trigger despawn after prolonged ground time
         if (this.inGround) {
-            this.inGroundTime++;
+            // Overflow guard
+            if (this.inGroundTime < Integer.MAX_VALUE) {
+                this.inGroundTime++;
+            }
         }
     }
 }

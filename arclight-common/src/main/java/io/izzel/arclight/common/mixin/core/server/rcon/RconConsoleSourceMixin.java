@@ -11,7 +11,19 @@ import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 
-@Mixin(RconConsoleSource.class)
+/**
+ * Mixin for {@link RconConsoleSource} that bridges RCON command execution
+ * with Bukkit's command sender system.
+ *
+ * <p>The RCON console source is used when commands are executed via the
+ * remote console protocol. This mixin allows Bukkit plugins to correctly
+ * identify and interact with the RCON sender via
+ * {@link CommandSourceBridge#bridge$getBukkitSender}.</p>
+ *
+ * <p>Messages sent to this source are appended to the RCON response buffer
+ * rather than being broadcast to players.</p>
+ */
+@Mixin(value = RconConsoleSource.class, priority = 1100)
 public class RconConsoleSourceMixin implements CommandSourceBridge, RconConsoleSourceBridge {
 
     // @formatter:off
@@ -19,10 +31,20 @@ public class RconConsoleSourceMixin implements CommandSourceBridge, RconConsoleS
     @Shadow @Final private MinecraftServer server;
     // @formatter:on
 
+    /**
+     * Returns the Bukkit remote console sender associated with this RCON session.
+     * Retrieved from the server bridge to ensure the correct sender instance is used.
+     */
     public CommandSender getBukkitSender() {
         return ((MinecraftServerBridge) this.server).bridge$getRemoteConsole();
     }
 
+    /**
+     * Appends a message to the RCON response buffer.
+     * The buffered content is sent back to the RCON client after command execution.
+     *
+     * @param message the message to append to the response buffer
+     */
     public void sendMessage(String message) {
         this.buffer.append(message);
     }

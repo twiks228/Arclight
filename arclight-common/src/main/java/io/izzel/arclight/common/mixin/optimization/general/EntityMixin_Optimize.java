@@ -28,7 +28,7 @@ public abstract class EntityMixin_Optimize {
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Optimize indirect passengers collection to avoid unnecessary allocations
      */
     @Overwrite
     public Iterable<Entity> getIndirectPassengers() {

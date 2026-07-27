@@ -16,23 +16,50 @@ import org.spongepowered.asm.mixin.Shadow;
 import java.util.ArrayList;
 import java.util.List;
 
-@Mixin(CompoundContainer.class)
+/**
+ * Mixin for {@link CompoundContainer} (double chest inventory) that integrates
+ * Bukkit's {@link IInventoryBridge} viewer tracking and inventory metadata.
+ *
+ * <p>A CompoundContainer wraps two side-by-side containers (e.g., two chest halves).
+ * Open/close events must be forwarded to both sub-containers so their internal
+ * viewer lists stay consistent, while this mixin maintains its own combined list.</p>
+ */
+@Mixin(value = CompoundContainer.class, priority = 1100)
 public abstract class CompoundContainerMixin implements IInventoryBridge, Container {
 
+    // @formatter:off
     @Shadow @Final public Container container1;
     @Shadow @Final public Container container2;
-    private List<HumanEntity> transactions = new ArrayList<>();
+    // @formatter:on
 
+    /**
+     * Tracks which players currently have this double-chest open.
+     * Managed by {@link #onOpen} and {@link #onClose}.
+     */
+    private final List<HumanEntity> transactions = new ArrayList<>();
+
+    // ── IInventoryBridge implementation ───────────────────────────────────────
+
+    /**
+     * Returns all item stacks from both sub-containers as a single flat list.
+     * The list is a snapshot — mutations do not affect the inventory.
+     */
     @Override
     public List<ItemStack> getContents() {
         int size = this.getContainerSize();
-        List<ItemStack> ret = new ArrayList<>(size);
+        List<ItemStack> contents = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
-            ret.add(this.getItem(i));
+            contents.add(this.getItem(i));
         }
-        return ret;
+        return contents;
     }
 
+    /**
+     * Notifies both sub-containers that a player has opened this inventory
+     * and adds the player to the combined viewer list.
+     *
+     * @param who the player opening the inventory
+     */
     @Override
     public void onOpen(CraftHumanEntity who) {
         ((IInventoryBridge) this.container1).onOpen(who);
@@ -40,6 +67,12 @@ public abstract class CompoundContainerMixin implements IInventoryBridge, Contai
         this.transactions.add(who);
     }
 
+    /**
+     * Notifies both sub-containers that a player has closed this inventory
+     * and removes the player from the combined viewer list.
+     *
+     * @param who the player closing the inventory
+     */
     @Override
     public void onClose(CraftHumanEntity who) {
         ((IInventoryBridge) this.container1).onClose(who);
@@ -52,31 +85,59 @@ public abstract class CompoundContainerMixin implements IInventoryBridge, Contai
         return transactions;
     }
 
+    /**
+     * Double-chest inventories are not owned by a specific block entity;
+     * ownership is determined by the individual chest halves.
+     */
     @Override
-    public InventoryHolder getOwner() { return null; }
+    public InventoryHolder getOwner() {
+        return null;
+    }
 
     @Override
-    public void setOwner(InventoryHolder owner) { }
+    public void setOwner(InventoryHolder owner) {
+        // No-op: double-chest ownership is determined by its sub-containers
+    }
 
+    /**
+     * Returns the most restrictive max stack size between the two sub-containers.
+     * This ensures items cannot exceed either container's individual limit.
+     */
     @Override
     public int getMaxStackSize() {
         return Math.min(this.container1.getMaxStackSize(), this.container2.getMaxStackSize());
     }
 
+    /**
+     * Propagates the max stack size to both sub-containers.
+     *
+     * @param size the new maximum stack size
+     */
     @Override
     public void setMaxStackSize(int size) {
         ((IInventoryBridge) this.container1).setMaxStackSize(size);
         ((IInventoryBridge) this.container2).setMaxStackSize(size);
     }
 
+    /**
+     * Returns the location of the first sub-container (the left chest half).
+     * Used by Bukkit to determine the inventory's world position.
+     */
     @Override
     public Location getLocation() {
         return ((IInventoryBridge) this.container1).getLocation();
     }
 
+    /**
+     * Double-chest inventories do not track the last used crafting recipe.
+     */
     @Override
-    public RecipeHolder<?> getCurrentRecipe() { return null; }
+    public RecipeHolder<?> getCurrentRecipe() {
+        return null;
+    }
 
     @Override
-    public void setCurrentRecipe(RecipeHolder<?> recipe) { }
+    public void setCurrentRecipe(RecipeHolder<?> recipe) {
+        // No-op: double-chests do not support recipe tracking
+    }
 }

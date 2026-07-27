@@ -1,0 +1,361 @@
+Конечно. Ниже даю **готовый полный handoff prompt** для нового диалога.  
+Ты сможешь просто **скопировать и вставить его в новый чат**, и ИИ сразу поймёт:
+
+- что это за проект
+- что уже сделано
+- где лежат файлы
+- что сейчас работает
+- какие проблемы остались
+- что делать дальше
+
+---
+
+# Готовый prompt для нового диалога
+
+```text
+Привет! Мы продолжаем работу над моим форком гибридного ядра Arclight для Minecraft 1.21.1.
+
+# Общий контекст проекта
+
+Это форк Arclight, рабочее название форка сейчас:
+Arclight J2K
+
+Репозиторий:
+https://github.com/twiks228/Arclight
+
+Локальный путь проекта:
+D:\Projects\VSCode\Arclight-J2k-by-Jake\Arclight
+
+Ветка:
+FeudalKings
+
+Окружение:
+- Windows 11
+- Java 21: Eclipse Adoptium OpenJDK 21.0.11
+- Gradle wrapper уже настроен на Java 21
+- Работаю в VS Code
+- Git работает
+
+# Цель форка
+
+Мы делаем улучшенный форк Arclight с упором на:
+1. Обновление NeoForge
+2. Улучшение совместимости модов и плагинов
+3. Улучшение installer / downloader
+4. Диагностику запуска
+5. Команду /j2k
+6. Лёгкий брендинг Arclight J2K
+
+# Что уже сделано
+
+## 1. NeoForge обновлён
+Изначально проект был привязан к старому NeoForge 21.1.192/21.1.228.
+Сейчас в проекте NeoForge обновлён до:
+
+21.1.236
+
+Файл:
+gradle/libs.versions.toml
+
+Строка:
+neoforge = '21.1.236'
+
+## 2. Installer / mirrors улучшены
+Мы уже переработали installer:
+- добавлены fallback mirrors
+- улучшен FileDownloader
+- улучшен MavenDownloader
+- улучшен buildSrc Utils.groovy
+- installer теперь показывает красивый ASCII banner
+- installer теперь ставит NeoForge 21.1.236
+
+Файлы:
+installer/src/main/java/io/izzel/arclight/installer/Mirrors.java
+installer/src/main/java/io/izzel/arclight/installer/FileDownloader.java
+installer/src/main/java/io/izzel/arclight/installer/MavenDownloader.java
+installer/src/main/java/io/izzel/arclight/installer/MinecraftProvider.java
+installer/src/main/java/io/izzel/arclight/installer/NeoforgeInstaller.java
+buildSrc/src/main/groovy/io/izzel/arclight/gradle/Utils.groovy
+
+## 3. Build repositories были исправлены
+В root build.gradle и buildSrc/build.gradle был изменён порядок репозиториев:
+- mavenCentral выше sponge
+- NeoForge maven добавлен как приоритетный fallback
+Это решило timeout / dependency resolution проблемы.
+
+Файлы:
+build.gradle
+buildSrc/build.gradle
+
+## 4. Добавлена диагностика запуска
+Добавлены новые классы:
+
+bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/StartupDiagnostics.java
+bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/ConflictDetector.java
+
+StartupDiagnostics:
+- выводит ранний баннер
+- выводит Java, OS, CPU, RAM
+- должен показывать Minecraft/NeoForge version
+- сейчас NeoForge version уже исправлена и читается из FML args
+- но версия форка в баннере всё ещё отображается криво (например "8.1.0"), это нужно ещё доработать
+
+ConflictDetector:
+- сканирует mods/ и plugins/
+- предупреждает о client-only модах на сервере
+- предупреждает о jar-файлах модов в plugins/
+- читает dependencies из mods.toml / neoforge.mods.toml
+- проверяет NeoForge version range
+- проверяет missing mandatory dependencies
+- сейчас уже работает хорошо
+
+## 5. Добавлена команда /j2k
+Создан встроенный Bukkit command:
+- /j2k help
+- /j2k status
+- /j2k version
+- /j2k memory
+- /j2k scan
+
+Файл команды:
+arclight-common/src/main/java/io/izzel/arclight/common/mod/command/J2KCommand.java
+
+Регистрация команды идёт в:
+arclight-common/src/main/java/io/izzel/arclight/common/mod/server/ArclightServer.java
+
+## 6. Лёгкий брендинг уже сделан
+Изменено:
+- display name в NeoForge mod descriptor
+- часть manifest metadata
+- логика Arclight J2K баннера
+
+Файл:
+arclight-neoforge/src/main/resources/META-INF/neoforge.mods.toml
+
+Также менялся:
+bootstrap/build.gradle
+
+## 7. ApplicationBootstrap уже исправляли
+Текущая версия должна читать:
+- --fml.neoForgeVersion
+- --fml.mcVersion
+
+Файл:
+bootstrap/src/neoforge/java/io/izzel/arclight/boot/neoforge/application/ApplicationBootstrap.java
+
+Это было нужно потому что раньше в diagnostics NeoForge показывался как 21.1.228, даже после обновления на 21.1.236.
+Сейчас NeoForge version в diagnostics уже показывает правильно: 21.1.236.
+
+# Что уже удалось запустить
+
+Мы успешно дошли до рабочего запуска сервера.
+NeoForge 21.1.236 поднимается.
+Installer работает.
+Arclight J2K banner работает.
+Compatibility checker работает.
+Часть модов и плагинов успешно грузится.
+Команда /j2k зарегистрирована.
+
+Примерный путь к собранному jar:
+D:\Projects\VSCode\Arclight-J2k-by-Jake\Arclight\bootstrap\build\libs\arclight-neoforge-1.21.1-1.0.2-SNAPSHOT.jar
+
+Тестовый сервер:
+D:\Server\arclight-test
+
+Start script test server:
+D:\Server\arclight-test\start.bat
+
+Важно:
+в start.bat уже добавлен флаг:
+-Darclight.alwaysExtract=true
+
+Это нужно, чтобы bootstrap всегда заново вытаскивал common.jar в .arclight/mod_file/
+
+# Что уже было проблемой и как решалось
+
+## Проблема: старый common.jar / NoClassDefFoundError IInventoryBridge
+Была ошибка:
+NoClassDefFoundError: io/izzel/arclight/common/bridge/core/world/IInventoryBridge
+
+Решение:
+- удалить D:\Server\arclight-test\.arclight
+- добавить -Darclight.alwaysExtract=true
+- пересобрать jar
+- запустить заново
+
+Сейчас эта проблема решена.
+
+## Проблема: несовместимые моды
+Мы уже нашли несколько модов, которые были несовместимы с текущими версиями:
+- sodium на сервере (client-only)
+- wakes (client-side / invalid dist)
+- createframed старой версии
+- CreateNumismatics старой версии
+- несколько модов требовали NeoForge 21.1.234+, поэтому подняли до 21.1.236
+- kotlinforforge пришлось обновить до 5.12.0
+- aeronautics_bundled и sable были добавлены как missing dependencies
+
+## Проблема: plugin jars в plugins/ без plugin.yml
+Compatibility checker и Bukkit already warned about jars in plugins/ that are not Bukkit plugins.
+Например:
+- Captcha-neoforge...
+- fabric-elytra-autopilot...
+- plasmovoice-neoforge...
+- warning-neoforge...
+Иногда некоторые из них на самом деле multi-platform, иногда это реальные ошибки раскладки.
+Нужно дальше разбирать аккуратно.
+
+# Что видно по текущему состоянию логов
+
+Последние успешные логи уже показывали:
+- NeoForge 21.1.236
+- Arclight J2K mod loaded
+- diagnostics banner
+- compatibility report
+- registration of /j2k command
+- загрузку множества модов и плагинов
+- запуск мира и Bukkit registration
+- server reached Done at least на одном из успешных прогонов
+
+Однако остались моменты для доработки:
+1. в diagnostics banner fork version всё ещё отображается криво (например "8.1.0")
+2. некоторые warnings/compat issues ещё надо чистить
+3. нужно довести compatibility checker
+4. нужно понять, какие моды/плагины оставлять в релизной рекомендации
+5. желательно улучшить /j2k scan и /j2k status
+6. возможно добавить /j2k doctor
+
+# Что нужно сделать дальше
+
+## Приоритетные следующие задачи
+1. Исправить отображение fork version в StartupDiagnostics
+2. Улучшить ConflictDetector:
+   - меньше ложных warning
+   - whitelist для известных multi-platform plugins
+   - лучшее чтение dependency blocks
+3. Улучшить /j2k scan
+4. Возможно добавить /j2k doctor
+5. Очистить финальные warning в plugins/
+6. Проверить и зафиксировать совместимый набор модов
+7. Подготовить финальный production-ready релиз
+
+# Какие файлы важны дальше
+
+## Сборка / версии / манифесты
+- gradle/libs.versions.toml
+- build.gradle
+- bootstrap/build.gradle
+- gradle.properties
+
+## Installer / downloader
+- installer/src/main/java/io/izzel/arclight/installer/Mirrors.java
+- installer/src/main/java/io/izzel/arclight/installer/FileDownloader.java
+- installer/src/main/java/io/izzel/arclight/installer/MavenDownloader.java
+- installer/src/main/java/io/izzel/arclight/installer/MinecraftProvider.java
+- installer/src/main/java/io/izzel/arclight/installer/NeoforgeInstaller.java
+- buildSrc/src/main/groovy/io/izzel/arclight/gradle/Utils.groovy
+
+## Bootstrap / startup
+- bootstrap/src/neoforge/java/io/izzel/arclight/boot/neoforge/application/ApplicationBootstrap.java
+- bootstrap/src/main/java/io/izzel/arclight/boot/AbstractBootstrap.java
+- bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/StartupDiagnostics.java
+- bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/ConflictDetector.java
+
+## Command system
+- arclight-common/src/main/java/io/izzel/arclight/common/mod/command/J2KCommand.java
+- arclight-common/src/main/java/io/izzel/arclight/common/mod/server/ArclightServer.java
+- arclight-common/src/main/java/io/izzel/arclight/common/mod/util/BukkitDispatcher.java
+- arclight-common/src/main/java/io/izzel/arclight/common/mixin/core/commands/CommandsMixin.java
+
+## Branding / mod metadata / i18n
+- arclight-neoforge/src/main/resources/META-INF/neoforge.mods.toml
+- i18n-config/src/main/resources/META-INF/i18n/en_us.conf
+- i18n-config/src/main/resources/META-INF/i18n/ru_ru.conf
+
+# Текущие требования к ответам
+- Общайся со мной по-русски
+- Комментарии в коде пиши на английском
+- Если предлагаешь изменения:
+  - сначала пиши, какой файл открыть
+  - потом пиши полный код файла или точный фрагмент
+  - объясняй, зачем меняем
+- Проси содержимое файлов, если нужно
+- Не пиши абстрактно, работай по текущей реальной структуре проекта
+
+# Что я хочу от нового диалога прямо сейчас
+Сначала помоги:
+1. проверить и исправить StartupDiagnostics version display
+2. улучшить ConflictDetector, чтобы было меньше ложных warning
+3. затем улучшить /j2k command
+4. затем помочь подготовить production-ready release
+
+Если нужно — проси коды файлов и пиши полные коды файлов или точные фрагменты.
+```
+
+---
+
+# Дополнительно: короткая версия prompt
+
+Если нужен **более короткий вариант**, вот он:
+
+```text
+Продолжаем работу над форком Arclight J2K.
+
+Repo:
+https://github.com/twiks228/Arclight
+
+Local path:
+D:\Projects\VSCode\Arclight-J2k-by-Jake\Arclight
+
+Branch:
+FeudalKings
+
+Environment:
+- Windows 11
+- Java 21 (Eclipse Adoptium 21.0.11)
+- VS Code
+- Gradle wrapper настроен на Java 21
+
+Уже сделано:
+- NeoForge обновлён до 21.1.236
+- installer / mirrors / downloader улучшены
+- diagnostics добавлены
+- conflict detector добавлен
+- /j2k command добавлен
+- брендинг Arclight J2K частично сделан
+- сервер уже запускался успешно
+- .arclight extraction issue уже решалась через -Darclight.alwaysExtract=true
+
+Ключевые файлы:
+- gradle/libs.versions.toml
+- build.gradle
+- bootstrap/build.gradle
+- installer/src/main/java/io/izzel/arclight/installer/*
+- bootstrap/src/neoforge/java/io/izzel/arclight/boot/neoforge/application/ApplicationBootstrap.java
+- bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/StartupDiagnostics.java
+- bootstrap/src/main/java/io/izzel/arclight/boot/diagnostic/ConflictDetector.java
+- arclight-common/src/main/java/io/izzel/arclight/common/mod/command/J2KCommand.java
+- arclight-common/src/main/java/io/izzel/arclight/common/mod/server/ArclightServer.java
+
+Текущие задачи:
+1. Исправить отображение fork version в StartupDiagnostics
+2. Уменьшить ложные warning в ConflictDetector
+3. Улучшить /j2k scan и /j2k status
+4. Подготовить production-ready release
+
+Общайся со мной по-русски.
+Комментарии в коде пиши на английском.
+Если нужны файлы — проси их и пиши полные коды файлов или точные фрагменты.
+```
+
+---
+
+Если хочешь, я ещё могу прямо сейчас отдельно подготовить тебе:
+
+1. **TODO.md для проекта**
+2. **список всех файлов, которые мы уже меняли**
+3. **финальный checklist перед production запуском**
+4. **шаблон issue/roadmap для GitHub**
+
+Если надо — скажи:  
+**“сделай ещё TODO.md и checklist”**

@@ -121,9 +121,9 @@ jar {
 tasks.register('forgeJar', Jar) {
     archiveBaseName.set "arclight-forge-${libs.versions.minecraft.get()}"
     manifest.attributes 'Main-Class': 'io.izzel.arclight.server.Launcher'
-    manifest.attributes 'Implementation-Title': 'Arclight'
+    manifest.attributes 'Implementation-Title': 'Arclight-J2K'
     manifest.attributes 'Implementation-Version': "arclight-${libs.versions.minecraft.get()}-${project.version}-$gitHash"
-    manifest.attributes 'Implementation-Vendor': 'Arclight Team'
+    manifest.attributes 'Implementation-Vendor': 'Jake (twiks228) / Arclight Team'
     manifest.attributes 'Implementation-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss")
     manifest.attributes 'Automatic-Module-Name': 'arclight.boot'
     from(configurations.embed.collect { it.isDirectory() ? it : zipTree(it) }) {
@@ -153,9 +153,9 @@ tasks.register('forgeJar', Jar) {
 tasks.register('neoforgeJar', Jar) {
     archiveBaseName.set "arclight-neoforge-${libs.versions.minecraft.get()}"
     manifest.attributes 'Main-Class': 'io.izzel.arclight.server.Launcher'
-    manifest.attributes 'Implementation-Title': 'Arclight'
+    manifest.attributes 'Implementation-Title': 'Arclight-J2K'
     manifest.attributes 'Implementation-Version': "arclight-${libs.versions.minecraft.get()}-${project.version}-$gitHash"
-    manifest.attributes 'Implementation-Vendor': 'Arclight Team'
+    manifest.attributes 'Implementation-Vendor': 'Jake (twiks228) / Arclight Team'
     manifest.attributes 'Implementation-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss")
     manifest.attributes 'Automatic-Module-Name': 'arclight.boot'
     from(configurations.embed.collect { it.isDirectory() ? it : zipTree(it) }) {
@@ -185,9 +185,9 @@ tasks.register('neoforgeJar', Jar) {
 tasks.register('fabricJar', Jar) {
     archiveBaseName.set "arclight-fabric-${libs.versions.minecraft.get()}"
     manifest.attributes 'Main-Class': 'io.izzel.arclight.server.Launcher'
-    manifest.attributes 'Implementation-Title': 'Arclight'
+    manifest.attributes 'Implementation-Title': 'Arclight-J2K'
     manifest.attributes 'Implementation-Version': "arclight-${libs.versions.minecraft.get()}-${project.version}-$gitHash"
-    manifest.attributes 'Implementation-Vendor': 'Arclight Team'
+    manifest.attributes 'Implementation-Vendor': 'Jake (twiks228) / Arclight Team'
     manifest.attributes 'Implementation-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss")
     manifest.attributes 'Automatic-Module-Name': 'arclight.boot'
     from(configurations.embedFabric.collect { it.isDirectory() ? it : zipTree(it) })

@@ -29,10 +29,8 @@ import java.util.Set;
 @LoadIfMod(modid = ModIds.IMMERSIVE_PORTALS, condition = LoadIfMod.ModCondition.ABSENT)
 public class ChunkMapMixin_Optimize {
 
-    // @formatter:off
     @Shadow @Final public Int2ObjectMap<ChunkMap.TrackedEntity> entityMap;
     @Shadow @Final public ServerLevel level;
-    // @formatter:on
 
     @Redirect(method = "move", at = @At(value = "INVOKE", remap = false, target = "Lit/unimi/dsi/fastutil/ints/Int2ObjectMap;values()Lit/unimi/dsi/fastutil/objects/ObjectCollection;"))
     private ObjectCollection<ChunkMap.TrackedEntity> arclight$markDirty(Int2ObjectMap<ChunkMap.TrackedEntity> instance, ServerPlayer player) {
@@ -40,10 +38,6 @@ public class ChunkMapMixin_Optimize {
         return new ObjectArraySet<>();
     }
 
-    /*
-     * This will result in Citizens2 generating NPC (is ServerPlayer) not known
-     * by clients joining earlier than itself. Disabled for fix.
-     */
     @Inject(method = "tick()V", cancellable = true, at = @At("HEAD"))
     private void arclight$optimizedTick(CallbackInfo ci) {
         var list = new ArrayList<ChunkMap.TrackedEntity>(this.level.players().size());
@@ -86,7 +80,6 @@ public class ChunkMapMixin_Optimize {
 
     @Mixin(ChunkMap.TrackedEntity.class)
     public static class TrackedEntityMixin {
-
         @Redirect(method = "<init>", at = @At(value = "INVOKE", remap = false, target = "Lcom/google/common/collect/Sets;newIdentityHashSet()Ljava/util/Set;"))
         private Set<ServerPlayerConnection> arclight$useFastUtilSet() {
             return new ReferenceOpenHashSet<>();

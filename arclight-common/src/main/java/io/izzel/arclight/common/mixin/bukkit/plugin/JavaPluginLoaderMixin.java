@@ -2,7 +2,6 @@ package io.izzel.arclight.common.mixin.bukkit.plugin;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
-import io.izzel.arclight.api.Unsafe;
 import io.izzel.arclight.common.bridge.bukkit.JavaPluginLoaderBridge;
 import io.izzel.arclight.common.bridge.bukkit.PluginClassLoaderBridge;
 import io.izzel.arclight.common.mod.server.ArclightServer;
@@ -12,8 +11,14 @@ import org.bukkit.Server;
 import org.bukkit.Warning;
 import org.bukkit.event.Event;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventException;
 import org.bukkit.event.Listener;
-import org.bukkit.plugin.*;
+import org.bukkit.plugin.AuthorNagException;
+import org.bukkit.plugin.EventExecutor;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.PluginDescriptionFile;
+import org.bukkit.plugin.RegisteredListener;
+import org.bukkit.plugin.SimplePluginManager;
 import org.bukkit.plugin.java.JavaPluginLoader;
 import org.jetbrains.annotations.NotNull;
 import org.objectweb.asm.ClassVisitor;
@@ -49,20 +54,26 @@ import java.util.logging.Level;
 public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
 
     // @formatter:off
-    @Shadow @Final Server server;
+    @Shadow @Final private Server server;
     @Invoker("setClass") public abstract void bridge$setClass(final String name, final Class<?> clazz);
     @Invoker("getClassByName") public abstract Class<?> arclight$getClassByName(String name, boolean resolve, PluginDescriptionFile description);
-    @Accessor("loaders") public abstract<T extends URLClassLoader & PluginClassLoaderBridge> List<T> arclight$getLoaders();
+    @Accessor("loaders") public abstract <T extends URLClassLoader & PluginClassLoaderBridge> List<T> arclight$getLoaders();
     // @formatter:on
 
     @Unique
     private MethodHandle arclight$mh_ctorPcl;
+    
     @Unique
     private static final AtomicInteger COUNTER = new AtomicInteger();
+    
     @Unique
     private static final Cache<Method, Class<? extends EventExecutor>> EXECUTOR_CACHE = CacheBuilder.newBuilder()
         .expireAfterAccess(1, TimeUnit.HOURS)
         .build();
+
+    @Unique
+    private static final MethodHandles.Lookup LOOKUP = MethodHandles.lookup();
+
     @Unique
     private static final String HIDDEN_FORM =
         Float.parseFloat(System.getProperty("java.class.version")) < 57
@@ -73,9 +84,12 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
     private void arclight$initMH(Server instance, CallbackInfo ci) {
         try {
             Class<?> clz = Class.forName("org.bukkit.plugin.java.PluginClassLoader", true, getClass().getClassLoader());
-            arclight$mh_ctorPcl = MethodHandles.lookup().findConstructor(clz, MethodType.methodType(void.class, String.class, JavaPluginLoader.class, ClassLoader.class, PluginDescriptionFile.class, File.class, File.class, ClassLoader.class));
+            arclight$mh_ctorPcl = MethodHandles.lookup().findConstructor(
+                clz, 
+                MethodType.methodType(void.class, String.class, JavaPluginLoader.class, ClassLoader.class, PluginDescriptionFile.class, File.class, File.class, ClassLoader.class)
+            );
         } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("Failed to initialize PluginClassLoader MethodHandle", e);
         }
     }
 
@@ -85,7 +99,7 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
         try {
             return arclight$mh_ctorPcl.invoke(desc.getName(), loader, parent, desc, file, file2, ex);
         } catch (Throwable e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("Failed to invoke PluginClassLoader constructor", e);
         }
     }
 
@@ -96,7 +110,7 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
 
     /**
      * @author InitAuther97
-     * @reason Support plugin class loader isolation
+     * @reason Support plugin class loader isolation for hybrid environments
      */
     @Overwrite
     Class<?> getClassByName(String name, boolean resolve, PluginDescriptionFile description) {
@@ -109,25 +123,25 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
                     try {
                         return loader.arclight$loadFromExternal(name, resolve, true);
                     } catch (ClassNotFoundException ignored) {
+                        // Ignore and try next loader
                     }
                 }
             }
         } else {
-
             for (PluginClassLoaderBridge loader : arclight$getLoaders()) {
                 try {
                     return loader.arclight$loadFromExternal(name, resolve, manager.isTransitiveDepend(description, loader.arclight$desc()));
                 } catch (ClassNotFoundException ignored) {
+                    // Ignore and try next loader
                 }
             }
         }
-
         return null;
     }
 
     /**
-     * @author IzzelAliz
-     * @reason use asm event executor
+     * @author IzzelAliz, Jake J2K
+     * @reason Use ASM event executor with Java 21+ compatible hidden classes and proper error logging.
      */
     @Overwrite
     @NotNull
@@ -135,7 +149,6 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
         Validate.notNull(plugin, "Plugin can not be null");
         Validate.notNull(listener, "Listener can not be null");
 
-        boolean useTimings = server.getPluginManager().useTimings();
         Map<Class<? extends Event>, Set<RegisteredListener>> ret = new HashMap<>();
         Set<Method> methods;
         try {
@@ -152,18 +165,21 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
         for (final Method method : methods) {
             final EventHandler eh = method.getAnnotation(EventHandler.class);
             if (eh == null) continue;
-            // Do not register bridge or synthetic methods to avoid event duplication
-            // Fixes SPIGOT-893
+            
+            // Do not register bridge or synthetic methods to avoid event duplication (Fixes SPIGOT-893)
             if (method.isBridge() || method.isSynthetic()) {
                 continue;
             }
+            
             final Class<?> checkClass;
             if (method.getParameterTypes().length != 1 || !Event.class.isAssignableFrom(checkClass = method.getParameterTypes()[0])) {
                 plugin.getLogger().severe(plugin.getDescription().getFullName() + " attempted to register an invalid EventHandler method signature \"" + method.toGenericString() + "\" in " + listener.getClass());
                 continue;
             }
+            
             final Class<? extends Event> eventClass = checkClass.asSubclass(Event.class);
             method.setAccessible(true);
+            
             Set<RegisteredListener> eventSet = ret.get(eventClass);
             if (eventSet == null) {
                 eventSet = new HashSet<>();
@@ -171,28 +187,29 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
             }
 
             for (Class<?> clazz = eventClass; Event.class.isAssignableFrom(clazz); clazz = clazz.getSuperclass()) {
-                // This loop checks for extending deprecated events
                 if (clazz.getAnnotation(Deprecated.class) != null) {
                     Warning warning = clazz.getAnnotation(Warning.class);
                     Warning.WarningState warningState = server.getWarningState();
                     if (!warningState.printFor(warning)) {
                         break;
                     }
-                    plugin.getLogger().log(
-                        Level.WARNING,
-                        String.format(
-                            "\"%s\" has registered a listener for %s on method \"%s\", but the event is Deprecated. \"%s\"; please notify the authors %s.",
-                            plugin.getDescription().getFullName(),
-                            clazz.getName(),
-                            method.toGenericString(),
-                            (warning != null && warning.reason().length() != 0) ? warning.reason() : "Server performance will be affected",
-                            Arrays.toString(plugin.getDescription().getAuthors().toArray())),
-                        warningState == Warning.WarningState.ON ? new AuthorNagException(null) : null);
+                    
+                    String message = String.format(
+                        "\"%s\" has registered a listener for %s on method \"%s\", but the event is Deprecated. \"%s\"; please notify the authors %s.",
+                        plugin.getDescription().getFullName(),
+                        clazz.getName(),
+                        method.toGenericString(),
+                        (warning != null && warning.reason().length() != 0) ? warning.reason() : "Server performance will be affected",
+                        Arrays.toString(plugin.getDescription().getAuthors().toArray())
+                    );
+                    
+                    // FIX: Explicitly typing as Throwable resolves the ambiguous method reference for Logger.log()
+                    Throwable ex = warningState == Warning.WarningState.ON ? new AuthorNagException(null) : null;
+                    plugin.getLogger().log(Level.WARNING, message, ex);
+                    
                     break;
                 }
             }
-
-            // final CustomTimingsHandler timings = new CustomTimingsHandler("Plugin: " + plugin.getDescription().getFullName() + " Event: " + listener.getClass().getName() + "::" + method.getName() + "(" + eventClass.getSimpleName() + ")", pluginParentTimer); // Spigot
 
             try {
                 Class<? extends EventExecutor> executorClass = createExecutor(method, eventClass);
@@ -200,8 +217,12 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
                 constructor.setAccessible(true);
                 EventExecutor executor = constructor.newInstance();
                 eventSet.add(new RegisteredListener(listener, executor, eh.priority(), plugin, eh.ignoreCancelled()));
-            } catch (Throwable t) {
-                t.printStackTrace();
+            } catch (Exception e) { // Changed from Throwable to Exception to avoid catching Errors like OutOfMemory
+                plugin.getLogger().log(
+                    Level.SEVERE, 
+                    "Failed to create ASM event executor for method '" + method.getName() + "' in listener '" + listener.getClass().getName() + "'. Plugin: " + plugin.getDescription().getFullName(), 
+                    e
+                );
             }
         }
         return ret;
@@ -210,28 +231,31 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
     @SuppressWarnings("unchecked")
     private Class<? extends EventExecutor> createExecutor(Method method, Class<? extends Event> eventClass) throws ExecutionException {
         return EXECUTOR_CACHE.get(method, () -> {
-            ClassWriter cv = new ClassWriter(ClassWriter.COMPUTE_MAXS);
-            cv.visit(Opcodes.V1_8,
-                Opcodes.ACC_SUPER + Opcodes.ACC_SYNTHETIC + Opcodes.ACC_FINAL,
-                Type.getInternalName(method.getDeclaringClass()) + "$$arclight$" + COUNTER.getAndIncrement(),
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+            String internalName = Type.getInternalName(method.getDeclaringClass()) + "$$arclight$" + COUNTER.getAndIncrement();
+            
+            cw.visit(
+                Opcodes.V1_8, // V1_8 is kept for maximum bytecode compatibility across different plugin compilations
+                Opcodes.ACC_SUPER | Opcodes.ACC_SYNTHETIC | Opcodes.ACC_FINAL,
+                internalName,
                 null,
                 Type.getInternalName(Object.class),
                 new String[]{Type.getInternalName(EventExecutor.class)}
             );
-            cv.visitOuterClass(Type.getInternalName(method.getDeclaringClass()), null, null);
-            createConstructor(cv);
-            createImpl(method, eventClass, cv);
-            cv.visitEnd();
-            return (Class<? extends EventExecutor>) Unsafe.defineAnonymousClass(method.getDeclaringClass(), cv.toByteArray(), null);
+            cw.visitOuterClass(Type.getInternalName(method.getDeclaringClass()), null, null);
+            
+            createConstructor(cw);
+            createImpl(method, eventClass, cw);
+            cw.visitEnd();
+
+            // JAVA 21+ COMPATIBLE HIDDEN CLASS GENERATION
+            MethodHandles.Lookup hiddenLookup = LOOKUP.defineHiddenClass(cw.toByteArray(), true, MethodHandles.Lookup.ClassOption.NESTMATE);
+            return (Class<? extends EventExecutor>) hiddenLookup.lookupClass();
         });
     }
 
     private void createConstructor(ClassVisitor cv) {
-        MethodVisitor mv = cv.visitMethod(
-            Opcodes.ACC_PRIVATE,
-            "<init>",
-            "()V",
-            null, null);
+        MethodVisitor mv = cv.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
         mv.visitCode();
         mv.visitVarInsn(Opcodes.ALOAD, 0);
         mv.visitMethodInsn(Opcodes.INVOKESPECIAL, Type.getInternalName(Object.class), "<init>", "()V", false);
@@ -246,7 +270,8 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
             Opcodes.ACC_PUBLIC,
             "execute",
             Type.getMethodDescriptor(Type.VOID_TYPE, Type.getType(Listener.class), Type.getType(Event.class)),
-            null, null
+            null, 
+            null
         );
         mv.visitAnnotation(HIDDEN_FORM, true);
 
@@ -254,22 +279,23 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
         Label label1 = new Label();
         Label label2 = new Label();
         mv.visitTryCatchBlock(label0, label1, label2, "java/lang/Throwable");
+        
         Label label3 = new Label();
         Label label4 = new Label();
-        // try {
+        
         mv.visitTryCatchBlock(label3, label4, label2, "java/lang/Throwable");
-        //   if (!(event instanceof TYPE))
+        
         mv.visitLabel(label0);
         mv.visitVarInsn(Opcodes.ALOAD, 2);
         mv.visitTypeInsn(Opcodes.INSTANCEOF, Type.getInternalName(eventClass));
         mv.visitJumpInsn(Opcodes.IFNE, label3);
-        //      return;
+        
         mv.visitLabel(label1);
         mv.visitInsn(Opcodes.RETURN);
+        
         mv.visitLabel(label3);
         mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
-        //   ((TYPE) listener).<method>(event);
-        //   TYPE.<method>(event);
+        
         int invokeCode;
         if (Modifier.isStatic(method.getModifiers())) {
             invokeCode = Opcodes.INVOKESTATIC;
@@ -278,38 +304,39 @@ public abstract class JavaPluginLoaderMixin implements JavaPluginLoaderBridge {
         } else {
             invokeCode = Opcodes.INVOKEVIRTUAL;
         }
+        
         if (invokeCode != Opcodes.INVOKESTATIC) {
             mv.visitVarInsn(Opcodes.ALOAD, 1);
             mv.visitTypeInsn(Opcodes.CHECKCAST, ownerType);
         }
+        
         mv.visitVarInsn(Opcodes.ALOAD, 2);
         mv.visitTypeInsn(Opcodes.CHECKCAST, Type.getInternalName(eventClass));
         mv.visitMethodInsn(invokeCode, ownerType, method.getName(), Type.getMethodDescriptor(method), invokeCode == Opcodes.INVOKEINTERFACE);
+        
         int retSize = Type.getType(method.getReturnType()).getSize();
         if (retSize > 0) {
             mv.visitInsn(Opcodes.POP + retSize - 1);
         }
+        
         mv.visitLabel(label4);
-        // } catch (Throwable t) {
         Label label5 = new Label();
         mv.visitJumpInsn(Opcodes.GOTO, label5);
+        
         mv.visitLabel(label2);
         mv.visitFrame(Opcodes.F_SAME1, 0, null, 1, new Object[]{"java/lang/Throwable"});
         mv.visitVarInsn(Opcodes.ASTORE, 3);
-        // throw new EventException(t);
-        Label label6 = new Label();
-        mv.visitLabel(label6);
+        
         mv.visitTypeInsn(Opcodes.NEW, "org/bukkit/event/EventException");
         mv.visitInsn(Opcodes.DUP);
         mv.visitVarInsn(Opcodes.ALOAD, 3);
         mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "org/bukkit/event/EventException", "<init>", "(Ljava/lang/Throwable;)V", false);
         mv.visitInsn(Opcodes.ATHROW);
+        
         mv.visitLabel(label5);
         mv.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
         mv.visitInsn(Opcodes.RETURN);
-        // }
-        Label label7 = new Label();
-        mv.visitLabel(label7);
+        
         mv.visitMaxs(-1, -1);
         mv.visitEnd();
     }

@@ -55,7 +55,19 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
-@Mixin(ServerEntity.class)
+/**
+ * Mixin for {@link ServerEntity} that integrates Bukkit's velocity event pipeline
+ * and entity tracking with wall-time awareness.
+ *
+ * <p>Key changes over vanilla:</p>
+ * <ul>
+ *   <li>Velocity changes fire {@link PlayerVelocityEvent} for server players</li>
+ *   <li>Tick-based counters use elapsed real ticks for lag compensation</li>
+ *   <li>Removed passengers trigger teleport corrections on the client</li>
+ *   <li>Scaled health injection into attribute send packets</li>
+ * </ul>
+ */
+@Mixin(value = ServerEntity.class, priority = 1100)
 public abstract class ServerEntityMixin implements ServerEntityBridge {
 
     // @formatter:off
@@ -73,33 +85,76 @@ public abstract class ServerEntityMixin implements ServerEntityBridge {
     @Shadow @Final private boolean trackDelta;
     @Shadow protected abstract void broadcastAndSend(Packet<?> packet);
     @Shadow @Nullable private List<SynchedEntityData.DataValue<?>> trackedDataValues;
-    @Shadow private static Stream<Entity> removedPassengers(List<Entity> p_277592_, List<Entity> p_277658_) { return null; }
+    @Shadow private static Stream<Entity> removedPassengers(List<Entity> current, List<Entity> previous) { return null; }
     @Shadow private int lastSentYRot;
     @Shadow private int lastSentXRot;
     @Shadow private Vec3 lastSentMovement;
     @Shadow private int lastSentYHeadRot;
     // @formatter:on
 
+    /** The set of connections currently tracking this entity. */
     private Set<ServerPlayerConnection> trackedPlayers;
-    @Unique private int lastTick;
-    @Unique private int lastUpdate, lastPosUpdate, lastMapUpdate;
+
+    /**
+     * Wall-clock tick counter for lag compensation.
+     * Initialized to {@code currentTick - 1} so the first update produces
+     * an elapsed time of 1 tick.
+     */
+    @Unique private int arclight$lastTick;
+
+    /**
+     * Last {@code tickCount / updateInterval} value used to throttle updates.
+     * Initialized to -1 so the first tick always sends a full update.
+     */
+    @Unique private int arclight$lastUpdate;
+
+    /** Last {@code tickCount / 60} for position update throttling. */
+    @Unique private int arclight$lastPosUpdate;
+
+    /** Last {@code tickCount / 10} for map item update throttling. */
+    @Unique private int arclight$lastMapUpdate;
+
+    // ── Initialization ────────────────────────────────────────────────────────
 
     @Inject(method = "<init>", at = @At("RETURN"))
-    private void arclight$init(ServerLevel serverWorld, Entity entity, int updateFrequency, boolean sendVelocityUpdates, Consumer<Packet<?>> packetConsumer, CallbackInfo ci) {
-        trackedPlayers = new HashSet<>();
-        lastTick = ArclightConstants.currentTick - 1;
-        lastUpdate = lastPosUpdate = lastMapUpdate = -1;
+    private void arclight$init(
+            ServerLevel serverWorld,
+            Entity entity,
+            int updateFrequency,
+            boolean sendVelocityUpdates,
+            Consumer<Packet<?>> packetConsumer,
+            CallbackInfo ci
+    ) {
+        this.trackedPlayers = new HashSet<>();
+        this.arclight$lastTick = ArclightConstants.currentTick - 1;
+        this.arclight$lastUpdate = -1;
+        this.arclight$lastPosUpdate = -1;
+        this.arclight$lastMapUpdate = -1;
     }
 
+    // ── Constructor bridge ────────────────────────────────────────────────────
+
     @ShadowConstructor
-    public void arclight$constructor(ServerLevel serverWorld, Entity entity, int updateFrequency, boolean sendVelocityUpdates, Consumer<Packet<?>> packetConsumer) {
-        throw new NullPointerException();
+    public void arclight$constructor(
+            ServerLevel serverWorld,
+            Entity entity,
+            int updateFrequency,
+            boolean sendVelocityUpdates,
+            Consumer<Packet<?>> packetConsumer) {
+        throw new NullPointerException("Shadow constructor stub");
     }
 
     @CreateConstructor
-    public void arclight$constructor(ServerLevel serverWorld, Entity entity, int updateFrequency, boolean sendVelocityUpdates, Consumer<Packet<?>> packetConsumer, Set<ServerPlayerConnection> set) {
+    public void arclight$constructor(
+            ServerLevel serverWorld,
+            Entity entity,
+            int updateFrequency,
+            boolean sendVelocityUpdates,
+            Consumer<Packet<?>> packetConsumer,
+            Set<ServerPlayerConnection> trackedPlayers
+    ) {
         arclight$constructor(serverWorld, entity, updateFrequency, sendVelocityUpdates, packetConsumer);
-        this.trackedPlayers = set;
+        this.trackedPlayers = trackedPlayers;
     }
 
     @Override
@@ -107,168 +162,283 @@ public abstract class ServerEntityMixin implements ServerEntityBridge {
         this.trackedPlayers = trackedPlayers;
     }
 
+    // ── Main tracking update ──────────────────────────────────────────────────
+
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Overwritten to integrate wall-time elapsed tick compensation,
+     * Bukkit PlayerVelocityEvent, and per-update counter tracking.
      */
     @Overwrite
     public void sendChanges() {
-        List<Entity> list = this.entity.getPassengers();
-        if (!list.equals(this.lastPassengers)) {
+        // ── Passenger tracking ────────────────────────────────────────────────
+        List<Entity> currentPassengers = this.entity.getPassengers();
+        if (!currentPassengers.equals(this.lastPassengers)) {
             this.broadcastAndSend(new ClientboundSetPassengersPacket(this.entity));
-            removedPassengers(list, this.lastPassengers).forEach((p_289307_) -> {
-                if (p_289307_ instanceof ServerPlayer serverplayer1) {
-                    serverplayer1.connection.teleport(serverplayer1.getX(), serverplayer1.getY(), serverplayer1.getZ(), serverplayer1.getYRot(), serverplayer1.getXRot());
+            // Teleport removed passengers to their current position to fix client desync
+            removedPassengers(currentPassengers, this.lastPassengers).forEach(removed -> {
+                if (removed instanceof ServerPlayer removedPlayer) {
+                    removedPlayer.connection.teleport(
+                        removedPlayer.getX(), removedPlayer.getY(), removedPlayer.getZ(),
+                        removedPlayer.getYRot(), removedPlayer.getXRot()
+                    );
                 }
             });
-            this.lastPassengers = list;
+            this.lastPassengers = currentPassengers;
         }
-        int elapsedTicks = ArclightConstants.currentTick - this.lastTick;
+
+        // ── Wall-time elapsed tick calculation ────────────────────────────────
+        int elapsedTicks = ArclightConstants.currentTick - this.arclight$lastTick;
         if (elapsedTicks < 0) {
             elapsedTicks = 0;
         }
-        this.lastTick = ArclightConstants.currentTick;
+        this.arclight$lastTick = ArclightConstants.currentTick;
+
+        // ── Item frame map updates ────────────────────────────────────────────
         if (this.entity instanceof ItemFrame itemFrame) {
-            ItemStack itemstack = itemFrame.getItem();
-            if (this.tickCount / 10 != this.lastMapUpdate && itemstack.getItem() instanceof MapItem) {
-                MapId mapId = itemstack.get(DataComponents.MAP_ID);
-                MapItemSavedData mapdata = MapItem.getSavedData(mapId, this.level);
-                if (mapdata != null) {
+            ItemStack mapStack = itemFrame.getItem();
+            if (this.tickCount / 10 != this.arclight$lastMapUpdate
+                    && mapStack.getItem() instanceof MapItem) {
+                MapId mapId = mapStack.get(DataComponents.MAP_ID);
+                MapItemSavedData mapData = MapItem.getSavedData(mapId, this.level);
+                if (mapData != null) {
                     for (ServerPlayerConnection connection : this.trackedPlayers) {
-                        var serverplayerentity = connection.getPlayer();
-                        mapdata.tickCarriedBy(serverplayerentity, itemstack);
-                        Packet<?> ipacket = mapdata.getUpdatePacket(mapId, serverplayerentity);
-                        if (ipacket != null) {
-                            serverplayerentity.connection.send(ipacket);
+                        ServerPlayer viewer = connection.getPlayer();
+                        mapData.tickCarriedBy(viewer, mapStack);
+                        Packet<?> mapPacket = mapData.getUpdatePacket(mapId, viewer);
+                        if (mapPacket != null) {
+                            viewer.connection.send(mapPacket);
                         }
                     }
                 }
             }
             this.sendDirtyEntityData();
         }
-        if (this.tickCount / this.updateInterval != this.lastUpdate || this.entity.hasImpulse || this.entity.getEntityData().isDirty()) {
+
+        // ── Position and rotation updates ─────────────────────────────────────
+        boolean needsUpdate = this.tickCount / this.updateInterval != this.arclight$lastUpdate
+            || this.entity.hasImpulse
+            || this.entity.getEntityData().isDirty();
+
+        if (needsUpdate) {
             if (this.entity.isPassenger()) {
-                int i1 = Mth.floor(this.entity.getYRot() * 256.0F / 360.0F);
-                int l1 = Mth.floor(this.entity.getXRot() * 256.0F / 360.0F);
-                boolean flag2 = Math.abs(i1 - this.lastSentYRot) >= 1 || Math.abs(l1 - this.lastSentXRot) >= 1;
-                if (flag2) {
-                    this.broadcast.accept(new ClientboundMoveEntityPacket.Rot(this.entity.getId(), (byte) i1, (byte) l1, this.entity.onGround()));
-                    this.lastSentYRot = i1;
-                    this.lastSentXRot = l1;
+                // Entity is riding — only send rotation updates
+                int encodedYRot = Mth.floor(this.entity.getYRot() * 256.0F / 360.0F);
+                int encodedXRot = Mth.floor(this.entity.getXRot() * 256.0F / 360.0F);
+                boolean rotChanged = Math.abs(encodedYRot - this.lastSentYRot) >= 1
+                    || Math.abs(encodedXRot - this.lastSentXRot) >= 1;
+
+                if (rotChanged) {
+                    this.broadcast.accept(new ClientboundMoveEntityPacket.Rot(
+                        this.entity.getId(), (byte) encodedYRot, (byte) encodedXRot,
+                        this.entity.onGround()
+                    ));
+                    this.lastSentYRot = encodedYRot;
+                    this.lastSentXRot = encodedXRot;
                 }
                 this.positionCodec.setBase(this.entity.trackingPosition());
                 this.sendDirtyEntityData();
                 this.wasRiding = true;
             } else {
+                // Entity is not riding — send full position/rotation updates
                 this.teleportDelay += elapsedTicks;
-                int l = Mth.floor(this.entity.getYRot() * 256.0F / 360.0F);
-                int k1 = Mth.floor(this.entity.getXRot() * 256.0F / 360.0F);
-                Vec3 vector3d = this.entity.trackingPosition();
-                boolean flag3 = this.positionCodec.delta(vector3d).lengthSqr() >= 7.62939453125E-6D;
-                Packet<?> ipacket1 = null;
-                boolean flag4 = flag3 || this.tickCount / 60 != this.lastPosUpdate;
-                boolean flag = Math.abs(l - this.lastSentYRot) >= 1 || Math.abs(k1 - this.lastSentXRot) >= 1;
-                boolean pos = false;
-                boolean rot = false;
-                long i = this.positionCodec.encodeX(vector3d);
-                long j = this.positionCodec.encodeY(vector3d);
-                long k = this.positionCodec.encodeZ(vector3d);
-                boolean flag1 = i < -32768L || i > 32767L || j < -32768L || j > 32767L || k < -32768L || k > 32767L;
-                if (!flag1 && this.teleportDelay <= 400 && !this.wasRiding && this.wasOnGround == this.entity.onGround()) {
-                    if ((!flag4 || !flag) && !(this.entity instanceof AbstractArrow)) {
-                        if (flag4) {
-                            ipacket1 = new ClientboundMoveEntityPacket.Pos(this.entity.getId(), (short) ((int) i), (short) ((int) j), (short) ((int) k), this.entity.onGround());
-                            pos = true;
-                        } else if (flag) {
-                            ipacket1 = new ClientboundMoveEntityPacket.Rot(this.entity.getId(), (byte) l, (byte) k1, this.entity.onGround());
-                            rot = true;
+
+                int encodedYRot = Mth.floor(this.entity.getYRot() * 256.0F / 360.0F);
+                int encodedXRot = Mth.floor(this.entity.getXRot() * 256.0F / 360.0F);
+                Vec3 trackingPos = this.entity.trackingPosition();
+                boolean posChanged = this.positionCodec.delta(trackingPos).lengthSqr() >= 7.62939453125E-6D;
+                boolean needsPeriodicPos = this.tickCount / 60 != this.arclight$lastPosUpdate;
+                boolean posNeedsUpdate = posChanged || needsPeriodicPos;
+                boolean rotNeedsUpdate = Math.abs(encodedYRot - this.lastSentYRot) >= 1
+                    || Math.abs(encodedXRot - this.lastSentXRot) >= 1;
+
+                boolean sendPos = false;
+                boolean sendRot = false;
+                Packet<?> movePacket = null;
+
+                long encodedX = this.positionCodec.encodeX(trackingPos);
+                long encodedY = this.positionCodec.encodeY(trackingPos);
+                long encodedZ = this.positionCodec.encodeZ(trackingPos);
+                boolean outOfRange = encodedX < -32768L || encodedX > 32767L
+                    || encodedY < -32768L || encodedY > 32767L
+                    || encodedZ < -32768L || encodedZ > 32767L;
+
+                if (!outOfRange && this.teleportDelay <= 400
+                        && !this.wasRiding && this.wasOnGround == this.entity.onGround()) {
+                    if ((!posNeedsUpdate || !rotNeedsUpdate) && !(this.entity instanceof AbstractArrow)) {
+                        if (posNeedsUpdate) {
+                            movePacket = new ClientboundMoveEntityPacket.Pos(
+                                this.entity.getId(),
+                                (short) ((int) encodedX), (short) ((int) encodedY), (short) ((int) encodedZ),
+                                this.entity.onGround()
+                            );
+                            sendPos = true;
+                        } else if (rotNeedsUpdate) {
+                            movePacket = new ClientboundMoveEntityPacket.Rot(
+                                this.entity.getId(),
+                                (byte) encodedYRot, (byte) encodedXRot,
+                                this.entity.onGround()
+                            );
+                            sendRot = true;
                         }
                     } else {
-                        ipacket1 = new ClientboundMoveEntityPacket.PosRot(this.entity.getId(), (short) ((int) i), (short) ((int) j), (short) ((int) k), (byte) l, (byte) k1, this.entity.onGround());
-                        pos = rot = true;
+                        movePacket = new ClientboundMoveEntityPacket.PosRot(
+                            this.entity.getId(),
+                            (short) ((int) encodedX), (short) ((int) encodedY), (short) ((int) encodedZ),
+                            (byte) encodedYRot, (byte) encodedXRot,
+                            this.entity.onGround()
+                        );
+                        sendPos = sendRot = true;
                     }
                 } else {
                     this.wasOnGround = this.entity.onGround();
                     this.teleportDelay = 0;
-                    ipacket1 = new ClientboundTeleportEntityPacket(this.entity);
-                    pos = rot = true;
+                    movePacket = new ClientboundTeleportEntityPacket(this.entity);
+                    sendPos = sendRot = true;
                 }
-                if ((this.trackDelta || this.entity.hasImpulse || this.entity instanceof LivingEntity && ((LivingEntity) this.entity).isFallFlying()) && this.tickCount > 0) {
-                    Vec3 vector3d1 = this.entity.getDeltaMovement();
-                    double d0 = vector3d1.distanceToSqr(this.lastSentMovement);
-                    if (d0 > 1.0E-7D || d0 > 0.0D && vector3d1.lengthSqr() == 0.0D) {
-                        this.lastSentMovement = vector3d1;
-                        if ( this.entity instanceof AbstractHurtingProjectile entityfireball) {
-                            this.broadcast.accept(new ClientboundBundlePacket(List.of(new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement), new ClientboundProjectilePowerPacket(entityfireball.getId(), entityfireball.accelerationPower))));
+
+                // Send velocity/impulse updates
+                boolean isFallFlying = this.entity instanceof LivingEntity living && living.isFallFlying();
+                if ((this.trackDelta || this.entity.hasImpulse || isFallFlying) && this.tickCount > 0) {
+                    Vec3 currentVelocity = this.entity.getDeltaMovement();
+                    double velDistSq = currentVelocity.distanceToSqr(this.lastSentMovement);
+                    if (velDistSq > 1.0E-7D
+                            || (velDistSq > 0.0D && currentVelocity.lengthSqr() == 0.0D)) {
+                        this.lastSentMovement = currentVelocity;
+                        if (this.entity instanceof AbstractHurtingProjectile fireball) {
+                            this.broadcast.accept(new ClientboundBundlePacket(List.of(
+                                new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement),
+                                new ClientboundProjectilePowerPacket(fireball.getId(), fireball.accelerationPower)
+                            )));
                         } else {
-                            this.broadcast.accept(new ClientboundSetEntityMotionPacket(this.entity.getId(), this.lastSentMovement));
+                            this.broadcast.accept(new ClientboundSetEntityMotionPacket(
+                                this.entity.getId(), this.lastSentMovement
+                            ));
                         }
                     }
                 }
-                if (ipacket1 != null) {
-                    this.broadcast.accept(ipacket1);
+
+                if (movePacket != null) {
+                    this.broadcast.accept(movePacket);
                 }
                 this.sendDirtyEntityData();
-                if (pos) {
-                    this.positionCodec.setBase(vector3d);
+
+                if (sendPos) {
+                    this.positionCodec.setBase(trackingPos);
                 }
-                if (rot) {
-                    this.lastSentYRot = l;
-                    this.lastSentXRot = k1;
+                if (sendRot) {
+                    this.lastSentYRot = encodedYRot;
+                    this.lastSentXRot = encodedXRot;
                 }
                 this.wasRiding = false;
             }
-            int j1 = Mth.floor(this.entity.getYHeadRot() * 256.0F / 360.0F);
-            if (Math.abs(j1 - this.lastSentYHeadRot) >= 1) {
-                this.broadcast.accept(new ClientboundRotateHeadPacket(this.entity, (byte) j1));
-                this.lastSentYHeadRot = j1;
+
+            // Head rotation
+            int encodedHeadRot = Mth.floor(this.entity.getYHeadRot() * 256.0F / 360.0F);
+            if (Math.abs(encodedHeadRot - this.lastSentYHeadRot) >= 1) {
+                this.broadcast.accept(new ClientboundRotateHeadPacket(this.entity, (byte) encodedHeadRot));
+                this.lastSentYHeadRot = encodedHeadRot;
             }
+
             this.entity.hasImpulse = false;
         }
-        this.lastUpdate = this.tickCount / this.updateInterval;
-        this.lastPosUpdate = this.tickCount / 60;
-        this.lastMapUpdate = this.tickCount / 10;
+
+        // ── Update throttle counters ───────────────────────────────────────────
+        this.arclight$lastUpdate    = this.tickCount / this.updateInterval;
+        this.arclight$lastPosUpdate = this.tickCount / 60;
+        this.arclight$lastMapUpdate = this.tickCount / 10;
         this.tickCount += elapsedTicks;
+
+        // ── Velocity / hurt marker ────────────────────────────────────────────
         if (this.entity.hurtMarked) {
             boolean cancelled = false;
-            if (this.entity instanceof ServerPlayer) {
-                Player player = ((ServerPlayerBridge) this.entity).bridge$getBukkitEntity();
-                Vector velocity = player.getVelocity();
-                PlayerVelocityEvent event = new PlayerVelocityEvent(player, velocity.clone());
+
+            if (this.entity instanceof ServerPlayer serverPlayer) {
+                Player bukkitPlayer = ((ServerPlayerBridge) serverPlayer).bridge$getBukkitEntity();
+                Vector currentVelocity = bukkitPlayer.getVelocity();
+                PlayerVelocityEvent event = new PlayerVelocityEvent(
+                    bukkitPlayer, currentVelocity.clone()
+                );
                 Bukkit.getPluginManager().callEvent(event);
+
                 if (event.isCancelled()) {
                     cancelled = true;
-                } else if (!velocity.equals(event.getVelocity())) {
-                    player.setVelocity(event.getVelocity());
+                } else if (!currentVelocity.equals(event.getVelocity())) {
+                    bukkitPlayer.setVelocity(event.getVelocity());
                 }
             }
-            if (cancelled) {
-                return;
+
+            if (!cancelled) {
+                this.entity.hurtMarked = false;
+                this.broadcastAndSend(new ClientboundSetEntityMotionPacket(this.entity));
             }
-            this.entity.hurtMarked = false;
-            this.broadcastAndSend(new ClientboundSetEntityMotionPacket(this.entity));
         }
     }
 
-    @Inject(method = "sendDirtyEntityData", locals = LocalCapture.CAPTURE_FAILHARD, at = @At(value = "INVOKE", ordinal = 1, target = "Lnet/minecraft/server/level/ServerEntity;broadcastAndSend(Lnet/minecraft/network/protocol/Packet;)V"))
-    private void arclight$sendScaledHealth(CallbackInfo ci, SynchedEntityData entitydatamanager, List<SynchedEntityData.DataValue<?>> list, Set<AttributeInstance> set) {
+    // ── Scaled health injection ───────────────────────────────────────────────
+
+    /**
+     * Injects scaled max health into attribute update packets for server players.
+     * This ensures the client-side health bar reflects Bukkit's health scale setting.
+     */
+    @Inject(
+        method = "sendDirtyEntityData",
+        locals = LocalCapture.CAPTURE_FAILHARD,
+        at = @At(
+            value = "INVOKE",
+            ordinal = 1,
+            target = "Lnet/minecraft/server/level/ServerEntity;broadcastAndSend(Lnet/minecraft/network/protocol/Packet;)V"
+        )
+    )
+    private void arclight$sendScaledHealth(
+            CallbackInfo ci,
+            SynchedEntityData entityDataManager,
+            List<SynchedEntityData.DataValue<?>> dataValues,
+            Set<AttributeInstance> attributeSet
+    ) {
         if (this.entity instanceof ServerPlayerBridge player) {
-            player.bridge$getBukkitEntity().injectScaledMaxHealth(set, false);
+            player.bridge$getBukkitEntity().injectScaledMaxHealth(attributeSet, false);
         }
     }
 
-    @Inject(method = "addPairing", cancellable = true, require = 0, at = @At("HEAD"))
+    // ── Pairing guards ────────────────────────────────────────────────────────
+
+    /**
+     * Prevents pairing (sending spawn data) for entities that have been removed.
+     * Without this, clients can receive spawn packets for entities that no longer exist,
+     * causing orphaned ghost entities.
+     */
+    @Inject(
+        method = "addPairing",
+        cancellable = true,
+        require = 0,
+        at = @At("HEAD")
+    )
     private void arclight$returnIfRemoved(CallbackInfo ci) {
         if (this.entity.isRemoved()) {
             ci.cancel();
         }
     }
 
-    @Redirect(method = "sendPairingData", require = 0, at = @At(value = "INVOKE", target = "Ljava/util/Collection;isEmpty()Z"))
-    private boolean arclight$injectScaledHealth(Collection<AttributeInstance> instance, ServerPlayer player) {
-        if (this.entity.getId() == player.getId()) {
-            ((ServerPlayerBridge) this.entity).bridge$getBukkitEntity().injectScaledMaxHealth(instance, false);
+    /**
+     * Injects scaled health for the local player when pairing data is sent.
+     * This is separate from {@link #arclight$sendScaledHealth} because pairing
+     * sends all attributes, not just dirty ones.
+     */
+    @Redirect(
+        method = "sendPairingData",
+        require = 0,
+        at = @At(
+            value = "INVOKE",
+            target = "Ljava/util/Collection;isEmpty()Z"
+        )
+    )
+    private boolean arclight$injectScaledHealthOnPairing(
+            Collection<AttributeInstance> attributes, ServerPlayer targetPlayer) {
+        if (this.entity.getId() == targetPlayer.getId()) {
+            ((ServerPlayerBridge) this.entity).bridge$getBukkitEntity()
+                .injectScaledMaxHealth(attributes, false);
         }
-        return instance.isEmpty();
+        return attributes.isEmpty();
     }
 }

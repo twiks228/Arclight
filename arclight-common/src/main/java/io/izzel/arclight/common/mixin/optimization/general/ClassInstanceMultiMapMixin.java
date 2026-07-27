@@ -22,11 +22,9 @@ import java.util.Map;
 @LoadIfMod(modid = {ModIds.LITHIUM, ModIds.CANARY, ModIds.RADIUM, ModIds.RECRUITS}, condition = LoadIfMod.ModCondition.ABSENT)
 public class ClassInstanceMultiMapMixin<T> {
 
-    // @formatter:off
     @Shadow @Final private Class<T> baseClass;
     @Shadow @Final @Mutable private Map<Class<?>, List<T>> byClass;
     @Shadow @Final @Mutable private List<T> allInstances;
-    // @formatter:on
 
     private static final ArrayList<?> EMPTY_LIST = new ArrayList<>();
 
@@ -48,19 +46,17 @@ public class ClassInstanceMultiMapMixin<T> {
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Lazy initialization for class instance multi map to save memory
      */
     @Overwrite(remap = false)
     public boolean add(T p_add_1_) {
         if (byClass != null) {
             boolean flag = false;
-
             for (Map.Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
                 if (entry.getKey().isInstance(p_add_1_)) {
                     flag |= entry.getValue().add(p_add_1_);
                 }
             }
-
             return flag;
         } else {
             byClass = new HashMap<>();
@@ -73,26 +69,24 @@ public class ClassInstanceMultiMapMixin<T> {
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Safe removal with null check to prevent NPE
      */
     @Overwrite(remap = false)
     public boolean remove(Object p_remove_1_) {
         if (byClass == null) return false;
         boolean flag = false;
-
         for (Map.Entry<Class<?>, List<T>> entry : this.byClass.entrySet()) {
             if (entry.getKey().isInstance(p_remove_1_)) {
                 List<T> list = entry.getValue();
                 flag |= list.remove(p_remove_1_);
             }
         }
-
         return flag;
     }
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Safe contains check
      */
     @Overwrite(remap = false)
     public boolean contains(Object p_contains_1_) {
@@ -101,7 +95,7 @@ public class ClassInstanceMultiMapMixin<T> {
 
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Optimized find method with lazy list creation
      */
     @Overwrite
     public <S> Collection<S> find(Class<S> p_219790_1_) {

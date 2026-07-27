@@ -27,41 +27,113 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 
 import java.net.SocketAddress;
 
-@Mixin(ServerConfigurationPacketListenerImpl.class)
-public abstract class ServerConfigurationPacketListenerImplMixin extends ServerCommonPacketListenerImplMixin {
+/**
+ * Mixin for {@link ServerConfigurationPacketListenerImpl} that handles
+ * the configuration phase of player login on hybrid servers.
+ *
+ * <p>Key behaviours:</p>
+ * <ul>
+ *   <li>Fires {@link PlayerLinksSendEvent} before server links are sent</li>
+ *   <li>Skips redundant login check during configuration→game transition
+ *       (the check was already performed during the login phase)</li>
+ *   <li>Reuses the existing {@link ServerPlayer} instance instead of creating
+ *       a new one, preserving state from the login phase</li>
+ * </ul>
+ */
+@Mixin(value = ServerConfigurationPacketListenerImpl.class, priority = 1100)
+public abstract class ServerConfigurationPacketListenerImplMixin
+        extends ServerCommonPacketListenerImplMixin {
 
     @Mutable
     @Shadow @Final private GameProfile gameProfile;
 
     @Shadow private ClientInformation clientInformation;
 
+    // ── Constructor ───────────────────────────────────────────────────────────
+
     @ShadowConstructor.Super
-    public abstract void arclight$super(MinecraftServer server, Connection connection, CommonListenerCookie cookie, ServerPlayer player);
+    public abstract void arclight$super(
+            MinecraftServer server, Connection connection,
+            CommonListenerCookie cookie, ServerPlayer player);
 
     @CreateConstructor
-    public void arclight$constructor(MinecraftServer server, Connection connection, CommonListenerCookie cookie, ServerPlayer player) {
+    public void arclight$constructor(
+            MinecraftServer server, Connection connection,
+            CommonListenerCookie cookie, ServerPlayer player) {
         arclight$super(server, connection, cookie, player);
         this.gameProfile = cookie.gameProfile();
         this.clientInformation = cookie.clientInformation();
     }
 
-    @Decorate(method = "startConfiguration", require = 0, at = @At(value = "INVOKE", target = "Lnet/minecraft/server/MinecraftServer;serverLinks()Lnet/minecraft/server/ServerLinks;"))
+    // ── Server links event ────────────────────────────────────────────────────
+
+    /**
+     * Fires {@link PlayerLinksSendEvent} before server links are sent to the client
+     * during the configuration phase. Allows plugins to modify the links.
+     * {@code require = 0} prevents crashes if the method signature changes in a future version.
+     */
+    @Decorate(
+        method = "startConfiguration",
+        require = 0,
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/MinecraftServer;serverLinks()Lnet/minecraft/server/ServerLinks;"
+        )
+    )
     private ServerLinks arclight$sendLinksEvent(MinecraftServer instance) throws Throwable {
         var links = (ServerLinks) DecorationOps.callsite().invoke(instance);
         var wrapper = new CraftServerLinks(links);
-        var event = new PlayerLinksSendEvent((Player) player.bridge$getBukkitEntity(), wrapper);
+        var event = new PlayerLinksSendEvent(
+            (Player) player.bridge$getBukkitEntity(), wrapper
+        );
         Bukkit.getPluginManager().callEvent(event);
         return wrapper.getServerLinks();
     }
 
-    @Redirect(method = "handleConfigurationFinished", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(Ljava/net/SocketAddress;Lcom/mojang/authlib/GameProfile;)Lnet/minecraft/network/chat/Component;"))
-    private Component arclight$skipLoginCheck(PlayerList instance, SocketAddress address, GameProfile gameProfile) {
-        return null;
+    // ── Configuration finished ────────────────────────────────────────────────
+
+    /**
+     * Skips the redundant {@code canPlayerLogin} check during configuration→game
+     * transition. The player was already validated during the login phase;
+     * re-checking here would incorrectly reject players if the server became
+     * full between login and configuration completion.
+     */
+    @Redirect(
+        method = "handleConfigurationFinished",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/players/PlayerList;canPlayerLogin(" +
+                     "Ljava/net/SocketAddress;" +
+                     "Lcom/mojang/authlib/GameProfile;" +
+                     ")Lnet/minecraft/network/chat/Component;"
+        )
+    )
+    private Component arclight$skipLoginCheck(
+            PlayerList instance, SocketAddress address, GameProfile profile) {
+        return null; // Always allow — already validated during login
     }
 
-    @Redirect(method = "handleConfigurationFinished", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/players/PlayerList;getPlayerForLogin(Lcom/mojang/authlib/GameProfile;Lnet/minecraft/server/level/ClientInformation;)Lnet/minecraft/server/level/ServerPlayer;"))
-    private ServerPlayer arclight$useCurrentPlayer(PlayerList instance, GameProfile p_215625_, ClientInformation p_300548_) {
-        this.player.updateOptions(p_300548_);
+    /**
+     * Reuses the existing {@link ServerPlayer} instance from the login phase
+     * instead of creating a new one. This preserves player state (inventory,
+     * position, etc.) that was set up during login event handling.
+     *
+     * <p>Also applies the latest {@link ClientInformation} from the configuration
+     * phase (language, render distance, etc.).</p>
+     */
+    @Redirect(
+        method = "handleConfigurationFinished",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/server/players/PlayerList;getPlayerForLogin(" +
+                     "Lcom/mojang/authlib/GameProfile;" +
+                     "Lnet/minecraft/server/level/ClientInformation;" +
+                     ")Lnet/minecraft/server/level/ServerPlayer;"
+        )
+    )
+    private ServerPlayer arclight$useCurrentPlayer(
+            PlayerList instance, GameProfile profile, ClientInformation clientInfo) {
+        this.player.updateOptions(clientInfo);
         return this.player;
     }
 }

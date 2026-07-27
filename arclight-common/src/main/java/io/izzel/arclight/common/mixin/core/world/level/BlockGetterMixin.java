@@ -14,27 +14,56 @@ import org.spongepowered.asm.mixin.Shadow;
 
 import javax.annotation.Nullable;
 
-@Mixin(BlockGetter.class)
+/**
+ * Mixin for the {@link BlockGetter} interface that exposes a block ray-trace
+ * helper method via {@link BlockGetterBridge}.
+ *
+ * <p>Provides a default {@link #clip(ClipContext, BlockPos)} implementation
+ * that tests both the block shape and the fluid shape and returns whichever
+ * hit is closer to the ray origin. This is equivalent to the vanilla logic
+ * extracted into a reusable form for Arclight's bridge layer.</p>
+ */
+@Mixin(value = BlockGetter.class, priority = 1100)
 public interface BlockGetterMixin extends BlockGetterBridge {
 
     // @formatter:off
     @Shadow BlockState getBlockState(BlockPos pos);
     @Shadow FluidState getFluidState(BlockPos pos);
-    @Shadow @Nullable BlockHitResult clipWithInteractionOverride(Vec3 startVec, Vec3 endVec, BlockPos pos, VoxelShape shape, BlockState state);
+    @Shadow @Nullable BlockHitResult clipWithInteractionOverride(
+            Vec3 startVec, Vec3 endVec, BlockPos pos, VoxelShape shape, BlockState state);
     // @formatter:on
 
+    /**
+     * Casts a ray through a single block, testing both the block's solid shape
+     * and its fluid shape, returning the closest hit.
+     *
+     * @param context the ray clip context (from/to positions, shape type)
+     * @param pos     the block position to test
+     * @return the closest {@link BlockHitResult}, or {@code null} if no hit
+     */
+    @Nullable
     default BlockHitResult clip(ClipContext context, BlockPos pos) {
-        BlockState blockstate = this.getBlockState(pos);
-        FluidState ifluidstate = this.getFluidState(pos);
-        Vec3 vec3d = context.getFrom();
-        Vec3 vec3d1 = context.getFrom();
-        VoxelShape voxelshape = context.getBlockShape(blockstate, (BlockGetter) this, pos);
-        BlockHitResult blockraytraceresult = this.clipWithInteractionOverride(vec3d, vec3d1, pos, voxelshape, blockstate);
-        VoxelShape voxelshape1 = context.getFluidShape(ifluidstate, (BlockGetter) this, pos);
-        BlockHitResult blockraytraceresult1 = voxelshape1.clip(vec3d, vec3d1, pos);
-        double d0 = blockraytraceresult == null ? Double.MAX_VALUE : context.getFrom().distanceToSqr(blockraytraceresult.getLocation());
-        double d1 = blockraytraceresult1 == null ? Double.MAX_VALUE : context.getFrom().distanceToSqr(blockraytraceresult1.getLocation());
-        return d0 <= d1 ? blockraytraceresult : blockraytraceresult1;
+        BlockState blockState = this.getBlockState(pos);
+        FluidState fluidState = this.getFluidState(pos);
+
+        Vec3 from = context.getFrom();
+        Vec3 to   = context.getTo();
+
+        // Test block solid shape
+        VoxelShape blockShape = context.getBlockShape(blockState, (BlockGetter) this, pos);
+        BlockHitResult blockHit = this.clipWithInteractionOverride(from, to, pos, blockShape, blockState);
+
+        // Test fluid shape (for water, lava interaction)
+        VoxelShape fluidShape = context.getFluidShape(fluidState, (BlockGetter) this, pos);
+        BlockHitResult fluidHit = fluidShape.clip(from, to, pos);
+
+        // Return whichever hit is closer to the ray origin
+        double blockDist = (blockHit == null) ? Double.MAX_VALUE
+            : context.getFrom().distanceToSqr(blockHit.getLocation());
+        double fluidDist = (fluidHit == null) ? Double.MAX_VALUE
+            : context.getFrom().distanceToSqr(fluidHit.getLocation());
+
+        return (blockDist <= fluidDist) ? blockHit : fluidHit;
     }
 
     @Override

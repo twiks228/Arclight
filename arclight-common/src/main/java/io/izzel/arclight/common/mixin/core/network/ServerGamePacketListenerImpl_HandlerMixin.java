@@ -38,20 +38,30 @@ import java.util.stream.Collectors;
 @Mixin(targets = "net/minecraft/server/network/ServerGamePacketListenerImpl$1")
 public class ServerGamePacketListenerImpl_HandlerMixin {
 
-    @Shadow(aliases = {"field_28963", "f_143671_", "this$0"}) private ServerGamePacketListenerImpl outerThis;
+    @Shadow(aliases = {"field_28963", "f_143671_", "this$0"}) 
+    private ServerGamePacketListenerImpl outerThis;
 
-    @Unique private transient Vec3 arclight$interactVec;
+    @Unique 
+    private transient Vec3 arclight$interactVec;
 
     @Decorate(method = "performInteraction", at = @At(value = "INVOKE", target = "Lnet/minecraft/server/network/ServerGamePacketListenerImpl$EntityInteraction;run(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/InteractionHand;)Lnet/minecraft/world/InteractionResult;"))
     private InteractionResult arclight$playerInteractEvent(ServerGamePacketListenerImpl.EntityInteraction instance, ServerPlayer player, Entity entity, InteractionHand interactionHand) throws Throwable {
         PlayerInteractEntityEvent event;
         if (arclight$interactVec != null) {
-            event = new PlayerInteractAtEntityEvent((Player) player.bridge$getBukkitEntity(), entity.bridge$getBukkitEntity(),
-                new org.bukkit.util.Vector(arclight$interactVec.x, arclight$interactVec.y, arclight$interactVec.z), (interactionHand == InteractionHand.OFF_HAND) ? EquipmentSlot.OFF_HAND : EquipmentSlot.HAND);
+            event = new PlayerInteractAtEntityEvent(
+                (Player) player.bridge$getBukkitEntity(), 
+                entity.bridge$getBukkitEntity(),
+                new org.bukkit.util.Vector(arclight$interactVec.x, arclight$interactVec.y, arclight$interactVec.z), 
+                (interactionHand == InteractionHand.OFF_HAND) ? EquipmentSlot.OFF_HAND : EquipmentSlot.HAND
+            );
         } else {
-            event = new PlayerInteractEntityEvent((Player) player.bridge$getBukkitEntity(), entity.bridge$getBukkitEntity(),
-                (interactionHand == InteractionHand.OFF_HAND) ? EquipmentSlot.OFF_HAND : EquipmentSlot.HAND);
+            event = new PlayerInteractEntityEvent(
+                (Player) player.bridge$getBukkitEntity(), 
+                entity.bridge$getBukkitEntity(),
+                (interactionHand == InteractionHand.OFF_HAND) ? EquipmentSlot.OFF_HAND : EquipmentSlot.HAND
+            );
         }
+        
         ItemStack itemInHand = player.getItemInHand(interactionHand);
         boolean triggerLeashUpdate = itemInHand != null && itemInHand.getItem() == Items.LEAD && entity instanceof Mob;
         Item origItem = player.getInventory().getSelected() == null ? null : player.getInventory().getSelected().getItem();
@@ -59,21 +69,25 @@ public class ServerGamePacketListenerImpl_HandlerMixin {
         Bukkit.getPluginManager().callEvent(event);
 
         // Fish bucket - SPIGOT-4048
-        if ((entity instanceof Bucketable && entity instanceof LivingEntity && origItem != null && origItem.asItem() == Items.WATER_BUCKET) && (event.isCancelled() || player.getInventory().getSelected() == null || player.getInventory().getSelected().getItem() != origItem)) {
+        if ((entity instanceof Bucketable && entity instanceof LivingEntity && origItem != null && origItem.asItem() == Items.WATER_BUCKET) && 
+            (event.isCancelled() || player.getInventory().getSelected() == null || player.getInventory().getSelected().getItem() != origItem)) {
             entity.bridge$getBukkitEntity().update(player);
             player.containerMenu.sendAllDataToRemote();
         }
 
         if (triggerLeashUpdate && (event.isCancelled() || player.getInventory().getSelected() == null || player.getInventory().getSelected().getItem() != origItem)) {
-            // Refresh the current leash state
             player.connection.send(new ClientboundSetEntityLinkPacket(entity, ((Mob) entity).getLeashHolder()));
         }
 
         if (event.isCancelled() || player.getInventory().getSelected() == null || player.getInventory().getSelected().getItem() != origItem) {
-            // Refresh the current entity metadata
             ((SynchedEntityDataBridge) entity.getEntityData()).bridge$refresh(player);
             if (entity instanceof Allay) {
-                player.connection.send(new ClientboundSetEquipmentPacket(entity.getId(), Arrays.stream(net.minecraft.world.entity.EquipmentSlot.values()).map((slot) -> Pair.of(slot, ((LivingEntity) entity).getItemBySlot(slot).copy())).collect(Collectors.toList())));
+                player.connection.send(new ClientboundSetEquipmentPacket(
+                    entity.getId(), 
+                    Arrays.stream(net.minecraft.world.entity.EquipmentSlot.values())
+                          .map((slot) -> Pair.of(slot, ((LivingEntity) entity).getItemBySlot(slot).copy()))
+                          .collect(Collectors.toList())
+                ));
                 player.containerMenu.sendAllDataToRemote();
             }
         }
@@ -81,8 +95,11 @@ public class ServerGamePacketListenerImpl_HandlerMixin {
         if (event.isCancelled()) {
             return (InteractionResult) DecorationOps.cancel().invoke();
         }
+        
         var result = (InteractionResult) DecorationOps.callsite().invoke(instance, player, entity, interactionHand);
-        if (!itemInHand.isEmpty() && itemInHand.getCount() <= -1) {
+        
+        // Исправление обрыва кода: синхронизация инвентаря при изменении стака
+        if (!itemInHand.isEmpty() && itemInHand.getCount() <= 0) {
             player.containerMenu.sendAllDataToRemote();
         }
         return result;
@@ -100,7 +117,8 @@ public class ServerGamePacketListenerImpl_HandlerMixin {
 
     @Decorate(method = "onAttack", inject = true, at = @At(value = "INVOKE", shift = At.Shift.AFTER, target = "Lnet/minecraft/server/level/ServerPlayer;attack(Lnet/minecraft/world/entity/Entity;)V"))
     private void arclight$sendDirty(@Local(ordinal = -1) ItemStack itemstack) {
-        if (!itemstack.isEmpty() && itemstack.getCount() <= -1) {
+        
+        if (itemstack != null && !itemstack.isEmpty() && itemstack.getCount() <= 0) {
             outerThis.player.containerMenu.sendAllDataToRemote();
         }
     }
