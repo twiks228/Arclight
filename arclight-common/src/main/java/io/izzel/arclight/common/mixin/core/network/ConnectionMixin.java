@@ -17,191 +17,222 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.lang.reflect.Field;
 import java.util.UUID;
 
-@Mixin(Connection.class)
+/**
+ * Mixin for {@link Connection} that adds BungeeCord/Velocity IP forwarding support
+ * and a compatibility fix for ProtocolLib on hybrid NeoForge+Bukkit servers.
+ *
+ * <p>Responsibilities:</p>
+ * <ul>
+ *   <li>Stores spoofed UUID and profile properties from BungeeCord/Velocity</li>
+ *   <li>Stores raw hostname for Bukkit IP forwarding handshake parsing</li>
+ *   <li>Prevents double-disconnect log spam</li>
+ *   <li>Fixes "Sending unknown packet 'clientbound/minecraft:disconnect'" when
+ *       ProtocolLib is installed alongside NeoForge mods</li>
+ * </ul>
+ */
+@Mixin(value = Connection.class, priority = 900)
 public class ConnectionMixin implements ConnectionBridge {
 
     @Unique
-    private static final Logger ARCLIGHT_J2K$LOGGER = LogManager.getLogger("Arclight-J2K");
+    private static final Logger ARCLIGHT_J2K$LOGGER =
+        LogManager.getLogger("Arclight-J2K");
 
-    @Shadow 
-    public boolean disconnectionHandled;
-    
-    @Shadow 
-    private Channel channel;
+    // ── Shadowed fields ──────────────────────────────────────────────────────
 
+    @Shadow public boolean disconnectionHandled;
+    @Shadow private Channel channel;
+
+    // ── BungeeCord / Velocity forwarding fields ──────────────────────────────
+
+    /** Spoofed player UUID from BungeeCord/Velocity IP forwarding. */
     public UUID spoofedUUID;
+
+    /** Spoofed profile properties (skin, etc.) from BungeeCord/Velocity. */
     public Property[] spoofedProfile;
+
+    /** Raw hostname string from the handshake, including BungeeCord extra data. */
     public String hostname;
 
-    // ── ConnectionBridge Implementation ──────────────────────────────────────────────
+    // ── ConnectionBridge implementation ──────────────────────────────────────
 
-    @Override
-    public UUID bridge$getSpoofedUUID() { 
-        return spoofedUUID; 
-    }
+    @Override public UUID bridge$getSpoofedUUID() { return spoofedUUID; }
+    @Override public void bridge$setSpoofedUUID(UUID uuid) { this.spoofedUUID = uuid; }
 
-    @Override
-    public void bridge$setSpoofedUUID(UUID spoofedUUID) { 
-        this.spoofedUUID = spoofedUUID; 
-    }
+    @Override public Property[] bridge$getSpoofedProfile() { return spoofedProfile; }
+    @Override public void bridge$setSpoofedProfile(Property[] p) { this.spoofedProfile = p; }
 
-    @Override
-    public Property[] bridge$getSpoofedProfile() { 
-        return spoofedProfile; 
-    }
+    @Override public String bridge$getHostname() { return hostname; }
+    @Override public void bridge$setHostname(String h) { this.hostname = h; }
 
-    @Override
-    public void bridge$setSpoofedProfile(Property[] spoofedProfile) { 
-        this.spoofedProfile = spoofedProfile; 
-    }
-
-    @Override
-    public String bridge$getHostname() { 
-        return hostname; 
-    }
-
-    @Override
-    public void bridge$setHostname(String hostname) { 
-        this.hostname = hostname; 
-    }
-
-    // ── Fixes & Patches ──────────────────────────────────────────────────────────────
+    // ── Disconnect duplicate fix ─────────────────────────────────────────────
 
     /**
-     * Prevents duplicate disconnect handling warnings.
+     * Prevents {@code handleDisconnection()} from running more than once,
+     * which would cause duplicate "Player disconnected" log entries.
      */
-    @Inject(method = "handleDisconnection", at = @At("HEAD"), cancellable = true)
-    private void arclight$noDisconnectTwiceWarn(CallbackInfo ci) {
+    @Inject(
+        method = "handleDisconnection",
+        at = @At("HEAD"),
+        cancellable = true
+    )
+    private void arclight$preventDuplicateDisconnect(CallbackInfo ci) {
         if (disconnectionHandled) {
             ci.cancel();
         }
     }
 
+    // ── ProtocolLib compatibility ─────────────────────────────────────────────
+
     /**
-     * ProtocolLib compatibility patch for hybrid servers (NeoForge + Bukkit).
+     * Fixes "Sending unknown packet 'clientbound/minecraft:disconnect'" when
+     * ProtocolLib is present on a hybrid NeoForge+Bukkit server.
      *
-     * When a network exception occurs, Minecraft tries to send a disconnect packet.
-     * ProtocolLib intercepts the write via NettyChannelProxy, but the packet codec
-     * in Arclight/NeoForge uses different IDs than ProtocolLib expects, causing:
-     *   "Sending unknown packet 'clientbound/minecraft:disconnect'"
+     * <p><b>Problem:</b> When a network exception occurs while ProtocolLib is active,
+     * Minecraft's {@code exceptionCaught} handler tries to send a disconnect packet.
+     * ProtocolLib intercepts this via {@code NettyChannelProxy}, but the packet codec
+     * registered by Arclight/NeoForge uses different packet IDs than ProtocolLib's
+     * injected codec expects. This produces:</p>
+     * <pre>
+     *   [ERROR] Sending unknown packet 'clientbound/minecraft:disconnect'
+     * </pre>
      *
-     * Fix strategy:
-     *   1. Detect if our channel is wrapped by ProtocolLib.
-     *   2. Try to unwrap and get the real underlying Netty channel.
-     *   3. If unwrap succeeds: replace this.channel temporarily so the normal
-     *      disconnect flow proceeds through the real channel instead of the proxy.
-     *   4. If unwrap fails: log and let the exception bubble up naturally
-     *      (do NOT close the channel — let Netty handle it).
+     * <p><b>Fix:</b></p>
+     * <ol>
+     *   <li>Detect if our channel is wrapped by a ProtocolLib proxy.</li>
+     *   <li>Extract the real underlying Netty channel via reflection.</li>
+     *   <li>If extraction succeeds: swap {@code this.channel} to bypass the proxy
+     *       codec and let the disconnect packet go directly to Netty.</li>
+     *   <li>If extraction fails: log at DEBUG and do nothing — let Netty's pipeline
+     *       handle cleanup. Do NOT close the channel manually as this causes
+     *       unnecessary reconnect delays.</li>
+     * </ol>
+     *
+     * <p>Priority 900 ensures this runs before ProtocolLib's own handlers.</p>
      */
-    @Inject(method = "exceptionCaught", at = @At("HEAD"), cancellable = true)
-    private void arclight$j2k$protocolLibSafeDisconnect(
-            ChannelHandlerContext context,
-            Throwable throwable,
+    @Inject(
+        method = "exceptionCaught",
+        at = @At("HEAD"),
+        cancellable = true
+    )
+    private void arclight$protocolLibSafeDisconnect(
+            ChannelHandlerContext ctx,
+            Throwable cause,
             CallbackInfo ci
     ) {
         try {
+            // Already disconnected — nothing more to do
             if (disconnectionHandled) {
                 ci.cancel();
                 return;
             }
 
-            Channel currentChannel = this.channel;
+            // Only intercept if a ProtocolLib proxy is in the pipeline
+            boolean isProxy = arclight$isProtocolLibProxy(this.channel)
+                || arclight$isProtocolLibProxy(ctx.channel());
 
-            if (!arclight$j2k$isProtocolLibProxy(currentChannel)
-                    && !arclight$j2k$isProtocolLibProxy(context.channel())) {
-                // Not a ProtocolLib channel — let normal handling proceed
+            if (!isProxy) {
+                // Standard Netty pipeline — let vanilla handling proceed normally
                 return;
             }
 
-            // Attempt to get the real underlying channel from the proxy
-            Channel realChannel = arclight$j2k$unwrapChannel(currentChannel);
+            // Attempt to unwrap the real channel from the proxy
+            Channel real = arclight$unwrapChannel(this.channel);
 
-            if (realChannel != null && realChannel != currentChannel) {
-                // Replace the proxy with the real channel so the disconnect packet
-                // goes directly to Netty without passing through ProtocolLib codec
-                this.channel = realChannel;
+            if (real != null && real != this.channel) {
+                // Swap to the real channel so the disconnect packet bypasses
+                // ProtocolLib's codec and goes directly to Netty
+                this.channel = real;
 
                 ARCLIGHT_J2K$LOGGER.debug(
-                    "[ProtocolLib-Compat] Unwrapped NettyChannelProxy to real channel {}. " +
-                    "Normal disconnect flow will proceed.",
-                    realChannel.getClass().getSimpleName()
+                    "[ProtocolLib-Compat] Unwrapped {} → {}. Proceeding with disconnect.",
+                    this.channel.getClass().getSimpleName(),
+                    real.getClass().getSimpleName()
                 );
 
-                // Do NOT cancel — let the original exceptionCaught logic run
-                // with the real channel now set
+                // Do NOT cancel — let vanilla exceptionCaught continue with real channel
                 return;
             }
 
-            // Unwrap failed — just log the issue but do not interfere.
-            // Closing the channel here causes reconnect delays.
-            // Let Netty and ProtocolLib handle cleanup on their own.
+            // Could not unwrap — stand back and let Netty/ProtocolLib handle it
             ARCLIGHT_J2K$LOGGER.debug(
-                "[ProtocolLib-Compat] Could not unwrap channel proxy. " +
-                "Letting Netty handle cleanup. Cause: {}",
-                throwable.getMessage()
+                "[ProtocolLib-Compat] Could not unwrap proxy channel. " +
+                "Allowing Netty to handle cleanup. Cause: {}",
+                cause.getMessage()
             );
 
         } catch (Throwable t) {
+            // Never let our fix crash the server tick thread
             ARCLIGHT_J2K$LOGGER.warn(
-                "[ProtocolLib-Compat] Workaround threw unexpected exception: {}",
+                "[ProtocolLib-Compat] Unexpected error in disconnect workaround: {}",
                 t.toString()
             );
         }
     }
 
+    // ── Utility helpers ──────────────────────────────────────────────────────
+
     /**
-     * Attempts to extract the real Netty Channel from inside a ProtocolLib proxy.
-     * ProtocolLib stores it under various field names depending on version.
+     * Returns {@code true} if the given channel is a ProtocolLib
+     * {@code NettyChannelProxy} or any class in the ProtocolLib namespace.
+     *
+     * @param ch the channel to inspect; may be {@code null}
      */
     @Unique
-    private static Channel arclight$j2k$unwrapChannel(Channel channel) {
-        if (channel == null) return null;
+    private static boolean arclight$isProtocolLibProxy(Channel ch) {
+        if (ch == null) return false;
+        String name = ch.getClass().getName();
+        return name.contains("NettyChannelProxy")
+            || name.contains("com.comphenix.protocol");
+    }
 
-        // Field names used by different ProtocolLib versions
-        String[] candidates = { "wrappedChannel", "channel", "originalChannel", "delegate" };
+    /**
+     * Attempts to extract the real underlying {@link Channel} from a ProtocolLib
+     * proxy using reflection over common field name candidates.
+     *
+     * <p>ProtocolLib has changed its internal field name across versions, so we
+     * try multiple candidates in order of most-to-least common.</p>
+     *
+     * @param ch the (potentially wrapped) channel; may be {@code null}
+     * @return the unwrapped channel, or {@code null} if extraction failed
+     */
+    @Unique
+    private static Channel arclight$unwrapChannel(Channel ch) {
+        if (ch == null) return null;
 
-        for (String fieldName : candidates) {
+        // Field name candidates used across different ProtocolLib versions
+        for (String candidate : new String[]{ "wrappedChannel", "channel", "originalChannel", "delegate" }) {
             try {
-                Field field = arclight$j2k$findField(channel.getClass(), fieldName);
-                if (field == null) continue;
-
-                field.setAccessible(true);
-                Object value = field.get(channel);
-
-                if (value instanceof Channel real && real != channel) {
+                Field f = arclight$findField(ch.getClass(), candidate);
+                if (f == null) continue;
+                f.setAccessible(true);
+                Object val = f.get(ch);
+                if (val instanceof Channel real && real != ch) {
                     return real;
                 }
             } catch (Throwable ignored) {
-                // Ignore reflection errors and try the next candidate
+                // Try next candidate
             }
         }
-
         return null;
     }
 
     /**
-     * Walks the class hierarchy to find a declared field by name.
+     * Searches the class hierarchy (including superclasses) for a declared field
+     * with the given name.
+     *
+     * @param clazz the class to start from
+     * @param name  the field name to find
+     * @return the {@link Field}, or {@code null} if not found in any superclass
      */
     @Unique
-    private static Field arclight$j2k$findField(Class<?> clazz, String name) {
-        Class<?> current = clazz;
-        while (current != null && current != Object.class) {
+    private static Field arclight$findField(Class<?> clazz, String name) {
+        for (Class<?> c = clazz; c != null && c != Object.class; c = c.getSuperclass()) {
             try {
-                return current.getDeclaredField(name);
+                return c.getDeclaredField(name);
             } catch (NoSuchFieldException ignored) {
-                current = current.getSuperclass();
+                // Walk up
             }
         }
         return null;
-    }
-
-    /**
-     * Returns true if the channel is a ProtocolLib NettyChannelProxy.
-     */
-    @Unique
-    private static boolean arclight$j2k$isProtocolLibProxy(Channel channel) {
-        if (channel == null) return false;
-        String name = channel.getClass().getName();
-        return name.contains("NettyChannelProxy") || name.contains("com.comphenix.protocol");
     }
 }

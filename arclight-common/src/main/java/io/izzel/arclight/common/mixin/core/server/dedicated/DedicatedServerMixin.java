@@ -33,18 +33,32 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Mixin for {@link DedicatedServer} that handles the dedicated server lifecycle,
+ * RCON support, and plugin initialization.
+ */
 @Mixin(DedicatedServer.class)
-public abstract class DedicatedServerMixin extends MinecraftServerMixin implements DedicatedServerBridge {
+public abstract class DedicatedServerMixin
+        extends MinecraftServerMixin
+        implements DedicatedServerBridge {
 
-    // @formatter:off
     @Shadow @Final public RconConsoleSource rconConsoleSource;
-    // @formatter:on
 
     public DedicatedServerMixin(String name) {
         super(name);
     }
 
-    @Inject(method = "initServer", at = @At(value = "INVOKE", shift = At.Shift.AFTER, target = "Lnet/minecraft/server/dedicated/DedicatedServer;setPlayerList(Lnet/minecraft/server/players/PlayerList;)V"))
+    // ── Plugin lifecycle ──────────────────────────────────────────────────────
+
+    @Inject(
+        method = "initServer",
+        at = @At(
+            value = "INVOKE",
+            shift = At.Shift.AFTER,
+            target = "Lnet/minecraft/server/dedicated/DedicatedServer;setPlayerList(" +
+                     "Lnet/minecraft/server/players/PlayerList;)V"
+        )
+    )
     public void arclight$loadPlugins(CallbackInfoReturnable<Boolean> cir) {
         this.bridge$forge$unlockRegistries();
         ((CraftServer) Bukkit.getServer()).loadPlugins();
@@ -52,7 +66,13 @@ public abstract class DedicatedServerMixin extends MinecraftServerMixin implemen
         this.bridge$forge$lockRegistries();
     }
 
-    @Inject(method = "initServer", at = @At(value = "FIELD", target = "Lnet/minecraft/server/dedicated/DedicatedServerProperties;enableRcon:Z"))
+    @Inject(
+        method = "initServer",
+        at = @At(
+            value = "FIELD",
+            target = "Lnet/minecraft/server/dedicated/DedicatedServerProperties;enableRcon:Z"
+        )
+    )
     public void arclight$setRcon(CallbackInfoReturnable<Boolean> cir) {
         this.remoteConsole = new CraftRemoteConsoleCommandSender(this.rconConsoleSource);
     }
@@ -64,35 +84,56 @@ public abstract class DedicatedServerMixin extends MinecraftServerMixin implemen
         }
     }
 
-    @Redirect(method = "handleConsoleInputs", at = @At(value = "INVOKE", target = "Lnet/minecraft/commands/Commands;performPrefixedCommand(Lnet/minecraft/commands/CommandSourceStack;Ljava/lang/String;)V"))
-    private void arclight$serverCommandEvent(Commands commands, CommandSourceStack source, String command) {
-        if (command.isEmpty()) {
-            return;
-        }
+    // ── Console command handling ───────────────────────────────────────────────
+
+    @Redirect(
+        method = "handleConsoleInputs",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/commands/Commands;performPrefixedCommand(" +
+                     "Lnet/minecraft/commands/CommandSourceStack;Ljava/lang/String;)V"
+        )
+    )
+    private void arclight$serverCommandEvent(
+            Commands commands, CommandSourceStack source, String command) {
+        if (command.isEmpty()) return;
+
         ServerCommandEvent event = new ServerCommandEvent(console, command);
         Bukkit.getPluginManager().callEvent(event);
         if (!event.isCancelled()) {
-            server.dispatchServerCommand(console, new ConsoleInput(event.getCommand(), source));
+            server.dispatchServerCommand(
+                console, new ConsoleInput(event.getCommand(), source)
+            );
         }
     }
 
+    // ── RCON ──────────────────────────────────────────────────────────────────
+
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Fire RemoteServerCommandEvent for RCON commands
      */
     @Overwrite
     public String runCommand(String command) {
         this.rconConsoleSource.prepareForCommand();
         this.executeBlocking(() -> {
-            RemoteServerCommandEvent event = new RemoteServerCommandEvent(remoteConsole, command);
+            RemoteServerCommandEvent event =
+                new RemoteServerCommandEvent(remoteConsole, command);
             Bukkit.getPluginManager().callEvent(event);
-            if (event.isCancelled()) {
-                return;
+            if (!event.isCancelled()) {
+                this.server.dispatchServerCommand(
+                    remoteConsole,
+                    new ConsoleInput(
+                        event.getCommand(),
+                        this.rconConsoleSource.createCommandSourceStack()
+                    )
+                );
             }
-            this.server.dispatchServerCommand(remoteConsole, new ConsoleInput(event.getCommand(), this.rconConsoleSource.createCommandSourceStack()));
         });
         return this.rconConsoleSource.getCommandResponse();
     }
+
+    // ── Server exit ───────────────────────────────────────────────────────────
 
     @Inject(method = "onServerExit", at = @At("RETURN"))
     public void arclight$exitNow(CallbackInfo ci) {
@@ -106,50 +147,56 @@ public abstract class DedicatedServerMixin extends MinecraftServerMixin implemen
         try {
             Thread.sleep(5000L);
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
         }
-        List<String> threads = new ArrayList<>();
+
+        List<String> nonDaemonThreads = new ArrayList<>();
         for (Thread thread : Thread.getAllStackTraces().keySet()) {
             if (!thread.isDaemon() && !thread.getName().equals("DestroyJavaVM")) {
-                threads.add(thread.getName());
+                nonDaemonThreads.add(thread.getName());
             }
         }
-        if (!threads.isEmpty()) {
-            ArclightServer.LOGGER.debug("Threads {} not shutting down", String.join(", ", threads));
-            ArclightServer.LOGGER.info("{} threads not shutting down correctly, force exiting", threads.size());
+
+        if (!nonDaemonThreads.isEmpty()) {
+            ArclightServer.LOGGER.debug(
+                "Threads {} not shutting down", String.join(", ", nonDaemonThreads)
+            );
+            ArclightServer.LOGGER.info(
+                "{} threads not shutting down correctly, force exiting",
+                nonDaemonThreads.size()
+            );
         }
         System.exit(0);
     }
 
+    // ── Plugin list for query ─────────────────────────────────────────────────
+
     /**
      * @author IzzelAliz
-     * @reason
+     * @reason Return Arclight-formatted plugin list for server query responses
      */
     @Overwrite
     public String getPluginNames() {
-        StringBuilder result = new StringBuilder();
+        StringBuilder sb = new StringBuilder();
         org.bukkit.plugin.Plugin[] plugins = server.getPluginManager().getPlugins();
 
-        result.append(server.getName());
-        result.append(" on Bukkit ");
-        result.append(server.getBukkitVersion());
+        sb.append(server.getName())
+          .append(" on Bukkit ")
+          .append(server.getBukkitVersion());
 
         if (plugins.length > 0 && server.getQueryPlugins()) {
-            result.append(": ");
-
+            sb.append(": ");
             for (int i = 0; i < plugins.length; i++) {
-                if (i > 0) {
-                    result.append("; ");
-                }
-
-                result.append(plugins[i].getDescription().getName());
-                result.append(" ");
-                result.append(plugins[i].getDescription().getVersion().replaceAll(";", ","));
+                if (i > 0) sb.append("; ");
+                sb.append(plugins[i].getDescription().getName())
+                  .append(" ")
+                  .append(plugins[i].getDescription().getVersion().replaceAll(";", ","));
             }
         }
-
-        return result.toString();
+        return sb.toString();
     }
+
+    // ── DedicatedServerBridge ─────────────────────────────────────────────────
 
     @Override
     public WorldLoader.DataLoadContext arclight$dataLoadContext() {
@@ -157,18 +204,29 @@ public abstract class DedicatedServerMixin extends MinecraftServerMixin implemen
     }
 
     @Override
-    public void arclight$forceUpgradeIfNeeded(LevelStorageSource.LevelStorageAccess worldSession, RegistryAccess.Frozen dimensions) {
+    public void arclight$forceUpgradeIfNeeded(
+            LevelStorageSource.LevelStorageAccess worldSession,
+            RegistryAccess.Frozen dimensions) {
         if (this.options.has("forceUpgrade")) {
-            net.minecraft.server.Main.forceUpgrade(worldSession, DataFixers.getDataFixer(), this.options.has("eraseCache"), () -> true, dimensions, this.options.has("recreateRegionFiles"));
+            net.minecraft.server.Main.forceUpgrade(
+                worldSession, DataFixers.getDataFixer(),
+                this.options.has("eraseCache"),
+                () -> true,
+                dimensions,
+                this.options.has("recreateRegionFiles")
+            );
         }
     }
 
     @Override
-    public void arclight$prepareAndAddLevel(ServerLevel internal, PrimaryLevelData levelData) {
+    public void arclight$prepareAndAddLevel(
+            ServerLevel internal, PrimaryLevelData levelData) {
         this.initWorld(internal, levelData, levelData, levelData.worldGenOptions());
         internal.setSpawnSettings(true, true);
         this.addLevel(internal);
-        this.prepareLevels(internal.getChunkSource().chunkMap.progressListener, internal);
+        this.prepareLevels(
+            internal.getChunkSource().chunkMap.progressListener, internal
+        );
         internal.entityManager.tick();
     }
 }
